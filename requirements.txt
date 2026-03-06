@@ -1,0 +1,5 @@
+python-docx>=1.1.0
+PySide6>=6.6.0
+lxml>=5.0.0
+pywin32>=306; platform_system == "Windows"
+pytest>=8.0.0

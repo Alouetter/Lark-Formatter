@@ -1,0 +1,27 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Test/cache temp
+.pytest_cache/
+crash.log
+
+# Build outputs
+build/
+dist/
+
+# Local IDE/agent metadata
+.claude/
+
+# Generated manual test artifacts
+tmp_repro/
+tmp_*.docx
+test*.docx
+*_排版附件/
+提示词模板/
+*_risk_100.txt
+参考文献*.docx
