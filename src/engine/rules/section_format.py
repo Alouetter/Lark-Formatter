@@ -1564,6 +1564,16 @@ def _is_unit_symbol_char(ch: str) -> bool:
     return ch in {"µ", "μ", "Ω", "ω", "°", "℃", "%", "‰"}
 
 
+def _token_has_unit_symbol_hint(token: str) -> bool:
+    """Heuristic: token looks like a scientific unit fragment."""
+    t = _normalize_formula_token_chars(token or "")
+    if not t:
+        return False
+    if any(_is_ascii_lower(ch) for ch in t):
+        return True
+    return any(ch in {"µ", "μ", "Ω", "ω", "%", "‰"} for ch in t)
+
+
 def _build_token_unit_formula_marks(token: str, right_char: str = "") -> list[str | None]:
     """Recognize scientific unit expressions and mark exponent part.
 
@@ -1684,7 +1694,9 @@ def _build_token_unit_formula_marks(token: str, right_char: str = "") -> list[st
 
     # Avoid cases like CHI760 where trailing digits should stay plain.
     if right_char and _is_word_or_cjk(right_char):
-        return [None] * n
+        # Allow unit exponents before CJK tails (common in Chinese text).
+        if not (_is_cjk(right_char) and _token_has_unit_symbol_hint(token)):
+            return [None] * n
     return token_marks if has_mark else [None] * n
 
 
@@ -1716,6 +1728,38 @@ def _build_token_formula_marks(
                     if style:
                         out[i] = style
                 return out
+
+    # Balanced wrapper around a single token, e.g. "(cm-2)", "[cm-2]".
+    wrapper_pairs = {"(": ")", "[": "]", "{": "}"}
+    outer_open = token[0]
+    outer_close = wrapper_pairs.get(outer_open, "")
+    if outer_close and n >= 3 and token[-1] == outer_close:
+        depth = 0
+        wrapped_once = True
+        for idx, ch in enumerate(token):
+            if ch == outer_open:
+                depth += 1
+            elif ch == outer_close:
+                depth -= 1
+                if depth == 0 and idx < n - 1:
+                    wrapped_once = False
+                    break
+                if depth < 0:
+                    wrapped_once = False
+                    break
+        inner = token[1:-1]
+        if wrapped_once and depth == 0 and _token_has_unit_symbol_hint(inner):
+            nested = _build_token_formula_marks(
+                inner,
+                right_char=outer_close,
+                right_non_space_char=outer_close,
+            )
+            if any(nested):
+                wrapped_marks: list[str | None] = [None] * n
+                for i, style in enumerate(nested):
+                    if style and (i + 1) < n:
+                        wrapped_marks[i + 1] = style
+                return wrapped_marks
 
     # Unbalanced wrapper noise around units, e.g. "(μmol·g-1·h-1" / "μmol·g-1·h-1)"
     unmatched_tail = {")": ("(", ")"), "]": ("[", "]"), "}": ("{", "}")}
