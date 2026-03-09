@@ -23,6 +23,7 @@ from src.scene.schema import SceneConfig, StyleConfig
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 _RE_CAPTION_LINE = re.compile(r"^(图|表|Figure|Table|Fig\.?)\s*\d", re.IGNORECASE)
+_COVER_LIKE_SECTION_TYPES = {"cover", "unknown"}
 
 
 def _w(tag: str) -> str:
@@ -684,7 +685,7 @@ class HeaderFooterRule(BaseRule):
                 header = docx_sec.header
                 header.is_linked_to_previous = False
                 _set_header_border(header._element,
-                                   sec_type != "cover")
+                                   sec_type not in _COVER_LIKE_SECTION_TYPES)
 
             if config.update_page_number and page_sc:
                 is_front = sec_type in front_types
@@ -738,7 +739,7 @@ class HeaderFooterRule(BaseRule):
         front_header_text = front_header_text or {}
         non_numbered_back_types = non_numbered_back_types or set()
 
-        if sec_type == "cover":
+        if sec_type in _COVER_LIKE_SECTION_TYPES:
             _build_empty_header(header._element)
             _set_header_border(header._element, False)
         elif sec_type in front_header_text:
