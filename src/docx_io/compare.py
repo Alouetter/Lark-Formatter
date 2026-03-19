@@ -60,6 +60,54 @@ def _build_ins_run(text: str, rpr_elem, rev_id: int,
     return ins_elem
 
 
+def _build_ins_container(rev_id: int, author: str, date: str):
+    """构建空的 <w:ins> 容器，用于包裹原段落内容。"""
+    ins_elem = etree.Element(_w("ins"))
+    ins_elem.set(_w("id"), str(rev_id))
+    ins_elem.set(_w("author"), author)
+    ins_elem.set(_w("date"), date)
+    return ins_elem
+
+
+def _paragraph_has_complex_content(para_elem) -> bool:
+    """Detect whether paragraph contains non-trivial OOXML that should be preserved."""
+    allowed_direct = {_w("pPr"), _w("r")}
+    for child in list(para_elem):
+        if child.tag not in allowed_direct:
+            return True
+    complex_tags = {
+        _w("drawing"),
+        _w("object"),
+        _w("pict"),
+        _w("fldSimple"),
+        _w("instrText"),
+        _w("fldChar"),
+        "{http://schemas.openxmlformats.org/officeDocument/2006/math}oMath",
+        "{http://schemas.openxmlformats.org/officeDocument/2006/math}oMathPara",
+    }
+    for node in para_elem.iter():
+        if node.tag in complex_tags:
+            return True
+    return False
+
+
+def _wrap_paragraph_content_as_inserted(para_elem, author: str, date: str) -> bool:
+    """将段落现有内容整体标为插入修订（不改写内容本身）。"""
+    content_children = [child for child in list(para_elem) if child.tag != _w("pPr")]
+    if not content_children:
+        return False
+
+    ins_elem = _build_ins_container(next_revision_id(), author, date)
+    for child in content_children:
+        para_elem.remove(child)
+        ins_elem.append(child)
+
+    ppr = para_elem.find(_w("pPr"))
+    insert_idx = list(para_elem).index(ppr) + 1 if ppr is not None else 0
+    para_elem.insert(insert_idx, ins_elem)
+    return True
+
+
 def _inject_text_revision(para_elem, old_text: str, new_text: str,
                           author: str, date: str):
     """在段落 XML 中注入文本修订标记：删除旧文本 + 插入新文本"""
@@ -77,15 +125,29 @@ def _inject_text_revision(para_elem, old_text: str, new_text: str,
     if first_run is not None:
         rpr_elem = _make_run_props(first_run)
 
-    # 清除段落中所有内容节点，保留段落属性 pPr。
-    # 仅删除直系 run 会遗漏 hyperlink/fldSimple/sdt 容器中的文本。
-    for child in list(para_elem):
-        if child.tag != _w("pPr"):
-            para_elem.remove(child)
-
     # 找到插入位置（在 pPr 之后）
     ppr = para_elem.find(_w("pPr"))
     insert_idx = list(para_elem).index(ppr) + 1 if ppr is not None else 0
+
+    # Preserve complex paragraph structures (e.g., hyperlinks/fields/objects/math).
+    # In this branch we only prepend revision marks and keep existing nodes untouched.
+    if _paragraph_has_complex_content(para_elem):
+        cur_idx = insert_idx
+        if old_text:
+            del_id = next_revision_id()
+            del_elem = _build_del_run(old_text, rpr_elem, del_id, author, date)
+            para_elem.insert(cur_idx, del_elem)
+            cur_idx += 1
+        if new_text:
+            ins_id = next_revision_id()
+            ins_elem = _build_ins_run(new_text, rpr_elem, ins_id, author, date)
+            para_elem.insert(cur_idx, ins_elem)
+        return True
+
+    # 清除段落中所有内容节点，保留段落属性 pPr。
+    for child in list(para_elem):
+        if child.tag != _w("pPr"):
+            para_elem.remove(child)
 
     cur_idx = insert_idx
     # 注入 <w:del> 旧文本
@@ -434,10 +496,8 @@ def _inject_revisions_by_doc_diff_on_final_base(
             for k in range(pair_count, new_count):
                 idx = j1 + k + offset
                 if idx < len(compare_doc.paragraphs):
-                    ok = _inject_text_revision(
+                    ok = _wrap_paragraph_content_as_inserted(
                         compare_doc.paragraphs[idx]._element,
-                        old_text="",
-                        new_text=final_texts[j1 + k],
                         author=author,
                         date=date,
                     )
@@ -468,10 +528,8 @@ def _inject_revisions_by_doc_diff_on_final_base(
             for k in range(j1, j2):
                 idx = k + offset
                 if idx < len(compare_doc.paragraphs):
-                    ok = _inject_text_revision(
+                    ok = _wrap_paragraph_content_as_inserted(
                         compare_doc.paragraphs[idx]._element,
-                        old_text="",
-                        new_text=final_texts[k],
                         author=author,
                         date=date,
                     )
@@ -494,8 +552,13 @@ def generate_compare_doc(original_doc: Document,
     若 final_doc 缺失，则回退到 tracker.text 记录。
     """
     reset_revision_counter()
-    # 有终稿时，以终稿为对比稿底稿，避免标题/题注等最终格式丢失。
-    compare_doc = copy.deepcopy(final_doc if final_doc is not None else original_doc)
+    # Use save/reload clone to avoid deepcopy corruption on python-docx/lxml trees.
+    from io import BytesIO
+    source_doc = final_doc if final_doc is not None else original_doc
+    buf = BytesIO()
+    source_doc.save(buf)
+    buf.seek(0)
+    compare_doc = Document(buf)
     author = REVISION_AUTHOR
     date = revision_date()
 
@@ -538,44 +601,33 @@ def generate_compare_doc(original_doc: Document,
             if format_changed_final:
                 original_texts = [p.text for p in original_doc.paragraphs]
                 final_texts = [p.text for p in final_doc.paragraphs]
-                final_to_compare = _build_final_to_compare_index_map(original_texts, final_texts)
+                if include_text:
+                    final_to_compare = _build_final_to_compare_index_map(original_texts, final_texts)
+                else:
+                    final_to_compare = {i: i for i in range(len(final_texts))}
                 for final_idx in sorted(format_changed_final):
                     idx = final_to_compare.get(final_idx)
                     if idx is None or idx in revised_para_indices:
                         continue
                     if idx >= len(compare_doc.paragraphs):
                         continue
-                    para = compare_doc.paragraphs[idx]
-                    text = para.text or ""
-                    if not text.strip():
-                        continue
-                    ok = _inject_text_revision(
-                        para._element,
-                        # Use insertion-only for formatting changes so Word always displays a visible revision.
-                        old_text="",
-                        new_text=text,
+                    ok = _wrap_paragraph_content_as_inserted(
+                        compare_doc.paragraphs[idx]._element,
                         author=author,
                         date=date,
                     )
                     if ok:
                         revised_para_indices.add(idx)
                         injected_count += 1
-        elif injected_count == 0:
+        elif final_doc is None:
             for rec in tracker.records:
                 idx = rec.paragraph_index
                 if idx < 0 or idx in revised_para_indices or rec.change_type in {"error", "text"}:
                     continue
                 if idx >= len(compare_doc.paragraphs):
                     continue
-                para = compare_doc.paragraphs[idx]
-                text = para.text or ""
-                if not text.strip():
-                    continue
-                ok = _inject_text_revision(
-                    para._element,
-                    # Fallback mode: insertion-only mark for formatting change visibility.
-                    old_text="",
-                    new_text=text,
+                ok = _wrap_paragraph_content_as_inserted(
+                    compare_doc.paragraphs[idx]._element,
                     author=author,
                     date=date,
                 )

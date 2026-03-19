@@ -19,11 +19,20 @@ from src.scene.heading_model import (
     get_non_numbered_title_sections,
 )
 from src.scene.schema import SceneConfig, StyleConfig
+from src.utils.indent import style_config_indent_kwargs, sync_indent_ooxml
+from src.utils.line_spacing import normalize_line_spacing, sync_spacing_ooxml
+from src.utils.ooxml import apply_explicit_rfonts
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 _RE_CAPTION_LINE = re.compile(r"^(图|表|Figure|Table|Fig\.?)\s*\d", re.IGNORECASE)
-_COVER_LIKE_SECTION_TYPES = {"cover", "unknown"}
+_COVER_LIKE_SECTION_TYPES = {"cover"}
+_ALIGNMENT_MAP = {
+    "left": "left",
+    "center": "center",
+    "right": "right",
+    "justify": "both",
+}
 
 
 def _w(tag: str) -> str:
@@ -32,8 +41,18 @@ def _w(tag: str) -> str:
 
 # ── 基础工具 ──
 
+def _set_toggle_rpr(rpr, tag: str, enabled: bool) -> None:
+    el = rpr.find(_w(tag))
+    if el is None:
+        el = etree.SubElement(rpr, _w(tag))
+    if enabled:
+        el.attrib.pop(_w("val"), None)
+    else:
+        el.set(_w("val"), "0")
+
+
 def _apply_run_style(r_el, sc: StyleConfig):
-    """给 run 元素应用字体和字号"""
+    """给 run 元素应用字符样式。"""
     rPr = r_el.find(_w("rPr"))
     if rPr is None:
         rPr = etree.SubElement(r_el, _w("rPr"))
@@ -41,6 +60,11 @@ def _apply_run_style(r_el, sc: StyleConfig):
     rf = rPr.find(_w("rFonts"))
     if rf is None:
         rf = etree.SubElement(rPr, _w("rFonts"))
+    apply_explicit_rfonts(
+        rPr,
+        font_cn=sc.font_cn,
+        font_en=sc.font_en,
+    )
     rf.set(_w("ascii"), sc.font_en)
     rf.set(_w("hAnsi"), sc.font_en)
     rf.set(_w("eastAsia"), sc.font_cn)
@@ -52,32 +76,61 @@ def _apply_run_style(r_el, sc: StyleConfig):
         if el is None:
             el = etree.SubElement(rPr, _w(tag))
         el.set(_w("val"), half_pt)
+    _set_toggle_rpr(rPr, "b", bool(sc.bold))
+    _set_toggle_rpr(rPr, "bCs", bool(sc.bold))
+    _set_toggle_rpr(rPr, "i", bool(sc.italic))
+    _set_toggle_rpr(rPr, "iCs", bool(sc.italic))
 
 
-def _set_para_center(p_el):
-    """居中、缩进0、间距0、单倍行距"""
+def _apply_para_style(p_el, sc: StyleConfig, *, default_alignment: str = "center") -> None:
+    """给页眉/页脚段落应用段落样式。"""
     pPr = p_el.find(_w("pPr"))
     if pPr is None:
         pPr = etree.SubElement(p_el, _w("pPr"))
         p_el.insert(0, pPr)
+
+    align_key = str(getattr(sc, "alignment", "") or "").strip().lower()
+    jc_val = _ALIGNMENT_MAP.get(align_key, default_alignment)
     jc = pPr.find(_w("jc"))
     if jc is None:
         jc = etree.SubElement(pPr, _w("jc"))
-    jc.set(_w("val"), "center")
-    # 缩进 0
-    ind = pPr.find(_w("ind"))
-    if ind is None:
-        ind = etree.SubElement(pPr, _w("ind"))
-    ind.set(_w("firstLine"), "0")
-    ind.set(_w("left"), "0")
-    # 间距 0，单倍行距
-    spacing = pPr.find(_w("spacing"))
-    if spacing is None:
-        spacing = etree.SubElement(pPr, _w("spacing"))
-    spacing.set(_w("before"), "0")
-    spacing.set(_w("after"), "0")
-    spacing.set(_w("line"), "240")
-    spacing.set(_w("lineRule"), "auto")
+    jc.set(_w("val"), jc_val)
+
+    sync_indent_ooxml(
+        p_el,
+        **style_config_indent_kwargs(sc),
+    )
+
+    resolved = normalize_line_spacing(
+        getattr(sc, "line_spacing_type", "exact"),
+        getattr(sc, "line_spacing_pt", 20.0),
+    )
+    if resolved is None:
+        sync_spacing_ooxml(
+            p_el,
+            space_before_pt=getattr(sc, "space_before_pt", 0.0),
+            space_after_pt=getattr(sc, "space_after_pt", 0.0),
+            line_spacing_type="single",
+            line_spacing_value=1.0,
+        )
+        return
+    sync_spacing_ooxml(
+        p_el,
+        space_before_pt=getattr(sc, "space_before_pt", 0.0),
+        space_after_pt=getattr(sc, "space_after_pt", 0.0),
+        line_spacing_type=getattr(sc, "line_spacing_type", "exact"),
+        line_spacing_value=getattr(sc, "line_spacing_pt", 20.0),
+    )
+
+
+def _apply_part_style(element, sc: StyleConfig, *, default_alignment: str = "center") -> None:
+    """把样式应用到整个页眉/页脚 XML 部件。"""
+    if sc is None:
+        return
+    for p in element.findall(_w("p")):
+        _apply_para_style(p, sc, default_alignment=default_alignment)
+    for r in element.iter(_w("r")):
+        _apply_run_style(r, sc)
 
 
 def _set_header_border(header_el, enable: bool):
@@ -576,7 +629,7 @@ def _build_styleref_header(
     """STYLEREF 域代码页眉，可配置引用样式与是否包含编号。"""
     _clear_element(header_el)
     p = etree.SubElement(header_el, _w("p"))
-    _set_para_center(p)
+    _apply_para_style(p, sc, default_alignment="center")
 
     if include_number:
         # STYLEREF \n -> 章节编号（从 numPr 取）
@@ -598,7 +651,7 @@ def _build_text_header(header_el, text, sc):
     """静态文本页眉"""
     _clear_element(header_el)
     p = etree.SubElement(header_el, _w("p"))
-    _set_para_center(p)
+    _apply_para_style(p, sc, default_alignment="center")
     _make_styled_run(p, sc, text=text)
 
 
@@ -614,7 +667,7 @@ def _build_page_footer(footer_el, sc, num_format="decimal"):
     """PAGE 域代码页脚，支持 decimal / upperRoman / lowerRoman"""
     _clear_element(footer_el)
     p = etree.SubElement(footer_el, _w("p"))
-    _set_para_center(p)
+    _apply_para_style(p, sc, default_alignment="center")
 
     _make_field_run(p, sc, "begin")
     if num_format == "decimal":

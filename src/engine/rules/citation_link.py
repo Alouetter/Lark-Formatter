@@ -11,6 +11,7 @@ from lxml import etree
 from src.engine.change_tracker import ChangeTracker
 from src.engine.rules.base import BaseRule
 from src.scene.schema import SceneConfig
+from src.utils.ooxml import apply_explicit_rfonts
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
@@ -20,12 +21,21 @@ def _w(tag: str) -> str:
     return f"{{{_W_NS}}}{tag}"
 
 
+_CITATION_OPEN_TO_CLOSE = {
+    "[": "]",
+    "\uFF3B": "\uFF3D",
+}
+_CITATION_OPEN_CHARS = "".join(_CITATION_OPEN_TO_CLOSE.keys())
+_CITATION_CLOSE_CHARS = "".join(_CITATION_OPEN_TO_CLOSE.values())
+
 _RE_REFERENCE_LABELS = [
-    re.compile(r"^\s*(\[(?P<num>\d{1,4})\])"),
-    re.compile("^\\s*([\\(\\uFF08]\\s*(?P<num>\\d{1,4})\\s*[\\)\\uFF09])"),
-    re.compile("^\\s*((?P<num>\\d{1,4})\\s*[\\.\\uFF0E\\u3001])"),
+    re.compile(r"^\s*([\[\uFF3B]\s*(?P<num>\d{1,4})\s*[\]\uFF3D])"),
 ]
-_RE_BRACKET_TOKEN = re.compile(r"\[(?P<inner>[^\[\]]+)\]")
+_RE_CITATION_TOKEN = re.compile(
+    r"(?P<open>\[|\uFF3B)"
+    r"(?P<inner>[^\[\]\uFF3B\uFF3D]+)"
+    r"(?P<close>\]|\uFF3D)"
+)
 _RE_NUM_TOKEN = re.compile(r"\d{1,4}")
 _RE_REF_FIELD_TARGET = re.compile(r"\bREF\s+(?P<target>[^\s\\]+)", re.IGNORECASE)
 _RE_NUMERIC_CITATION_INNER = re.compile(
@@ -142,6 +152,40 @@ def _compose_ref_num_bookmark_name(entry_bookmark: str | None) -> str:
     return f"{_REF_NUM_BOOKMARK_PREFIX}{tail}"
 
 
+def _is_matching_citation_pair(open_bracket: str, close_bracket: str) -> bool:
+    return _CITATION_OPEN_TO_CLOSE.get(open_bracket) == close_bracket
+
+
+def _text_has_citation_brackets(text: str) -> bool:
+    raw = text or ""
+    return any(ch in raw for ch in _CITATION_OPEN_CHARS) and any(
+        ch in raw for ch in _CITATION_CLOSE_CHARS
+    )
+
+
+def _paragraph_run_field_depths(para) -> dict[int, int]:
+    """Map each direct run element id to its surrounding field nesting depth."""
+    depth = 0
+    run_depths: dict[int, int] = {}
+    for child in para._element:
+        if child.tag != _w("r"):
+            continue
+        run_depths[id(child)] = depth
+        fld_char = child.find(_w("fldChar"))
+        if fld_char is None:
+            continue
+        fld_type = (fld_char.get(_w("fldCharType")) or "").strip().lower()
+        if fld_type == "begin":
+            depth += 1
+        elif fld_type == "end":
+            depth = max(0, depth - 1)
+    return run_depths
+
+
+def _run_is_safe_plain_text(run_el, run_depths: dict[int, int]) -> bool:
+    return run_depths.get(id(run_el), 0) == 0 and _run_is_plain_text_only(run_el)
+
+
 def _paragraph_has_field(para) -> bool:
     p_el = para._element
     return (
@@ -230,6 +274,12 @@ def _build_citation_rpr(rpr_src) -> etree._Element:
     rfonts = rpr.find(_w("rFonts"))
     if rfonts is None:
         rfonts = etree.SubElement(rpr, _w("rFonts"))
+    apply_explicit_rfonts(
+        rpr,
+        font_cn="Times New Roman",
+        font_en="Times New Roman",
+        font_cs="Times New Roman",
+    )
     rfonts.set(_w("ascii"), "Times New Roman")
     rfonts.set(_w("hAnsi"), "Times New Roman")
     rfonts.set(_w("eastAsia"), "Times New Roman")
@@ -285,107 +335,10 @@ def _make_citation_text_run(text: str, rpr_src) -> etree._Element:
     return r
 
 
-def _para_has_reference_seq_field(para) -> bool:
-    for instr in para._element.iter(_w("instrText")):
-        code = re.sub(r"\s+", " ", (instr.text or "")).strip().upper()
-        if "SEQ" in code and _REF_ENTRY_SEQ_ID.upper() in code:
-            return True
-    return False
-
-
-def _first_run_rpr(para):
-    for run in para.runs:
-        rpr = run._element.find(_w("rPr"))
-        if rpr is not None:
-            return rpr
-    return None
-
-
-def _strip_prefix_chars_from_runs(para, strip_len: int) -> None:
-    if strip_len <= 0:
-        return
-    remaining = strip_len
-    for run in para.runs:
-        txt = run.text or ""
-        if not txt:
-            continue
-        if remaining >= len(txt):
-            run.text = ""
-            remaining -= len(txt)
-            continue
-        run.text = txt[remaining:]
-        remaining = 0
-        break
-    # remove leading whitespace once
-    for run in para.runs:
-        txt = run.text or ""
-        if not txt:
-            continue
-        run.text = txt.lstrip(" \t\u3000")
-        break
-
-
-def _strip_reference_label_prefix(para) -> bool:
-    full_text = para.text or ""
-    cut = _extract_reference_label_end(full_text)
-    if cut is None:
-        return False
-    _strip_prefix_chars_from_runs(para, cut)
-    return True
-
-
-def _insert_reference_seq_prefix(
-    para,
-    *,
-    number_bookmark: str,
-    number_bookmark_id: int,
-    display_hint: int | None = None,
-) -> None:
-    p_el = para._element
-    ppr = p_el.find(_w("pPr"))
-    insert_idx = list(p_el).index(ppr) + 1 if ppr is not None else 0
-    rpr_src = _first_run_rpr(para)
-    display = str(display_hint if isinstance(display_hint, int) and display_hint > 0 else 1)
-
-    seq_instr = f" SEQ {_REF_ENTRY_SEQ_ID} \\* ARABIC "
-    nodes = [
-        _make_text_run("[", rpr_src),
-        etree.Element(_w("bookmarkStart")),
-        _make_field_run("begin", rpr_src, dirty=True),
-        _make_instr_run(seq_instr, rpr_src),
-        _make_field_run("separate", rpr_src),
-        _make_text_run(display, rpr_src),
-        _make_field_run("end", rpr_src),
-        etree.Element(_w("bookmarkEnd")),
-        _make_text_run("] ", rpr_src),
-    ]
-    nodes[1].set(_w("id"), str(number_bookmark_id))
-    nodes[1].set(_w("name"), number_bookmark)
-    nodes[7].set(_w("id"), str(number_bookmark_id))
-
-    for node in nodes:
-        p_el.insert(insert_idx, node)
-        insert_idx += 1
-
-
 def _build_hyperlink_field_runs(anchor: str, display_text: str, rpr_src) -> list[etree._Element]:
     return [
         _make_field_run("begin", rpr_src, dirty=True, citation=True),
         _make_instr_run(f' HYPERLINK \\l "{anchor}" ', rpr_src, citation=True),
-        _make_field_run("separate", rpr_src, citation=True),
-        _make_citation_text_run(display_text, rpr_src),
-        _make_field_run("end", rpr_src, citation=True),
-    ]
-
-
-def _build_ref_field_runs(bookmark_name: str, display_text: str, rpr_src) -> list[etree._Element]:
-    return [
-        _make_field_run("begin", rpr_src, dirty=True, citation=True),
-        _make_instr_run(
-            f" REF {bookmark_name} \\h \\* CHARFORMAT \\* MERGEFORMAT ",
-            rpr_src,
-            citation=True,
-        ),
         _make_field_run("separate", rpr_src, citation=True),
         _make_citation_text_run(display_text, rpr_src),
         _make_field_run("end", rpr_src, citation=True),
@@ -593,8 +546,14 @@ def _first_non_space_char(text: str) -> str | None:
     return None
 
 
-def _first_non_space_char_from_runs(runs_snapshot: list, start_idx: int) -> str | None:
+def _first_non_space_char_from_runs(
+    runs_snapshot: list,
+    start_idx: int,
+    run_depths: dict[int, int],
+) -> str | None:
     for run in runs_snapshot[start_idx:]:
+        if not _run_is_safe_plain_text(run._element, run_depths):
+            continue
         ch = _first_non_space_char(run.text or "")
         if ch is not None:
             return ch
@@ -729,6 +688,61 @@ def _strip_reference_label_prefix(para) -> bool:
     return True
 
 
+def _run_is_plain_text_only(run_el) -> bool:
+    if run_el is None or run_el.tag != _w("r"):
+        return False
+    for child in list(run_el):
+        tag = child.tag
+        if tag in {_w("rPr"), _w("t")}:
+            continue
+        return False
+    return True
+
+
+def _coalesce_split_bracket_runs(para) -> None:
+    """Merge minimal safe run ranges so split citations become one plain-text run."""
+    run_depths = _paragraph_run_field_depths(para)
+    runs = list(para.runs)
+    i = 0
+    while i < len(runs):
+        start_run = runs[i]
+        if not _run_is_safe_plain_text(start_run._element, run_depths):
+            i += 1
+            continue
+        start_text = start_run.text or ""
+        if not any(ch in start_text for ch in _CITATION_OPEN_CHARS):
+            i += 1
+            continue
+        if any(ch in start_text for ch in _CITATION_CLOSE_CHARS):
+            i += 1
+            continue
+
+        j = i + 1
+        while j < len(runs):
+            if not _run_is_safe_plain_text(runs[j]._element, run_depths):
+                break
+            end_text = runs[j].text or ""
+            if not any(ch in end_text for ch in _CITATION_CLOSE_CHARS):
+                j += 1
+                continue
+
+            segment = runs[i:j + 1]
+            merged_text = "".join(r.text or "" for r in segment)
+            if not _RE_CITATION_TOKEN.search(merged_text):
+                j += 1
+                continue
+            start_run.text = merged_text
+            for k in range(j, i, -1):
+                run_el = runs[k]._element
+                parent = run_el.getparent()
+                if parent is not None:
+                    parent.remove(run_el)
+            runs = list(para.runs)
+            break
+
+        i += 1
+
+
 def _replace_citation_tokens_in_paragraph(
     para,
     num_to_target: dict[int, str],
@@ -741,12 +755,16 @@ def _replace_citation_tokens_in_paragraph(
     if not para.runs:
         return linked, unresolved
 
+    _coalesce_split_bracket_runs(para)
+    run_depths = _paragraph_run_field_depths(para)
     runs_snapshot = list(para.runs)
     for run_idx, run in enumerate(runs_snapshot):
-        run_text = run.text or ""
-        if "[" not in run_text or "]" not in run_text:
+        if not _run_is_safe_plain_text(run._element, run_depths):
             continue
-        matches = list(_RE_BRACKET_TOKEN.finditer(run_text))
+        run_text = run.text or ""
+        if not _text_has_citation_brackets(run_text):
+            continue
+        matches = list(_RE_CITATION_TOKEN.finditer(run_text))
         if not matches:
             continue
 
@@ -756,7 +774,11 @@ def _replace_citation_tokens_in_paragraph(
         insert_at = parent.index(run._element)
         rpr_src = run._element.find(_w("rPr"))
         cursor = 0
-        next_char_hint = _first_non_space_char_from_runs(runs_snapshot, run_idx + 1)
+        next_char_hint = _first_non_space_char_from_runs(
+            runs_snapshot,
+            run_idx + 1,
+            run_depths,
+        )
 
         for m in matches:
             start, end = m.span()
@@ -766,13 +788,19 @@ def _replace_citation_tokens_in_paragraph(
 
             token = m.group(0)
             inner = m.group("inner") or ""
-            if not _RE_NUMERIC_CITATION_INNER.fullmatch(inner) or not _RE_NUM_TOKEN.search(inner):
+            open_bracket = m.group("open") or ""
+            close_bracket = m.group("close") or ""
+            if (
+                not _is_matching_citation_pair(open_bracket, close_bracket)
+                or not _RE_NUMERIC_CITATION_INNER.fullmatch(inner)
+                or not _RE_NUM_TOKEN.search(inner)
+            ):
                 parent.insert(insert_at, _make_text_run(token, rpr_src))
                 insert_at += 1
                 cursor = end
                 continue
 
-            parent.insert(insert_at, _make_citation_text_run("[", rpr_src))
+            parent.insert(insert_at, _make_citation_text_run(open_bracket, rpr_src))
             insert_at += 1
 
             inner_cursor = 0
@@ -805,7 +833,7 @@ def _replace_citation_tokens_in_paragraph(
                 parent.insert(insert_at, _make_citation_text_run(tail_text, rpr_src))
                 insert_at += 1
 
-            parent.insert(insert_at, _make_citation_text_run("]", rpr_src))
+            parent.insert(insert_at, _make_citation_text_run(close_bracket, rpr_src))
             insert_at += 1
 
             outer_end = end
@@ -863,10 +891,16 @@ def _build_reference_targets(
             # Existing citation field in references entry is treated as locked content.
             continue
 
-        reference_entries_count += 1
         parsed_num = _extract_reference_number(text)
-
         entry_bookmark = _find_ref_entry_bookmark_name(para)
+        has_seq = _para_has_reference_seq_field(para)
+        if parsed_num is None and not entry_bookmark and not has_seq:
+            # Only [1]-style labels (including fullwidth square brackets) are
+            # eligible as bibliography entries. Skip list items like "(1) 标题".
+            continue
+
+        reference_entries_count += 1
+
         if not entry_bookmark:
             next_entry_serial += 1
             entry_bookmark = _ensure_unique_bookmark_name(
@@ -886,7 +920,6 @@ def _build_reference_targets(
                     _compose_ref_num_bookmark_name(entry_bookmark),
                     existing_names,
                 )
-                has_seq = _para_has_reference_seq_field(para)
                 if not has_seq:
                     _strip_reference_label_prefix(para)
                     _insert_reference_seq_prefix(
@@ -917,8 +950,11 @@ def _build_reference_targets(
             continue
         if not target_bookmark:
             continue
+        if parsed_num in duplicated_numbers:
+            continue
         if parsed_num in num_to_target:
             duplicated_numbers.add(parsed_num)
+            num_to_target.pop(parsed_num, None)
             continue
         num_to_target[parsed_num] = target_bookmark
 
@@ -1012,9 +1048,8 @@ class CitationLinkRule(BaseRule):
                 para = doc.paragraphs[i]
                 if not (para.text or "").strip():
                     continue
-                if "[" not in (para.text or ""):
-                    continue
-                if _paragraph_has_blocking_field(para):
+                has_blocking_field = _paragraph_has_blocking_field(para)
+                if has_blocking_field:
                     normalized_fields = _normalize_existing_citation_ref_fields(para)
                     if normalized_fields > 0:
                         repaired_field_paras += 1
@@ -1028,6 +1063,7 @@ class CitationLinkRule(BaseRule):
                             paragraph_index=i,
                         )
                     skipped_field_paras += 1
+                if not _text_has_citation_brackets(para.text or ""):
                     continue
 
                 linked, unresolved = _replace_citation_tokens_in_paragraph(
@@ -1082,6 +1118,6 @@ class CitationLinkRule(BaseRule):
                 section="references",
                 change_type="field",
                 before=f"duplicated numbering detected: {dup_text}",
-                after="mapped to first matched entry only",
+                after="duplicate references left unlinked to avoid ambiguity",
                 paragraph_index=ref_start,
             )

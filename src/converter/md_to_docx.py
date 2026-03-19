@@ -1,5 +1,6 @@
 """独立 Markdown → DOCX 转换器"""
 
+import re
 from pathlib import Path
 from docx import Document
 from docx.shared import Pt, Cm
@@ -10,6 +11,7 @@ from src.markdown.block_parser import parse_markdown_text
 from src.markdown.ir import MarkdownBlock, BlockType, InlineSpan, InlineType
 from src.markdown.word_render import (
     write_spans, set_no_proof, add_hyperlink, write_table_cell,
+    normalize_ordered_list_style, normalize_unordered_list_style,
     register_list_numbering, apply_num_pr, apply_blockquote_border,
     insert_image, add_footnote,
 )
@@ -22,6 +24,43 @@ HEADING_STYLE_MAP = {
     3: "Heading 3", 4: "Heading 4",
     5: "Heading 4", 6: "Heading 4",
 }
+
+
+def _resolve_list_marker_separator(config: SceneConfig) -> str:
+    md_cfg = getattr(config, "md_cleanup", None)
+    raw = str(getattr(md_cfg, "list_marker_separator", "tab") or "").strip().lower()
+    if raw in {"half_space", "space", "halfwidth_space"}:
+        return "half_space"
+    if raw in {"full_space", "fullwidth_space"}:
+        return "full_space"
+    return "tab"
+
+
+def _list_separator_text(separator: str) -> str:
+    if separator == "full_space":
+        return "\u3000"
+    if separator == "half_space":
+        return " "
+    return "\t"
+
+
+def _resolve_ordered_list_style(config: SceneConfig) -> str:
+    md_cfg = getattr(config, "md_cleanup", None)
+    raw = str(getattr(md_cfg, "ordered_list_style", "mixed") or "").strip().lower()
+    return normalize_ordered_list_style(raw)
+
+
+def _resolve_unordered_list_style(config: SceneConfig) -> str:
+    md_cfg = getattr(config, "md_cleanup", None)
+    raw = str(getattr(md_cfg, "unordered_list_style", "word_default") or "").strip().lower()
+    return normalize_unordered_list_style(raw)
+
+
+def _is_ordered_list_marker(marker: str) -> bool:
+    s = str(marker or "").strip()
+    if not s:
+        return False
+    return bool(re.match(r"^(?:\d+[.)、]|[（(]\d+[)）])$", s))
 
 
 def convert_md_to_docx(md_path: str, output_path: str,
@@ -44,8 +83,21 @@ def convert_md_to_docx(md_path: str, output_path: str,
     tracker = ChangeTracker()
 
     # 预注册列表编号
-    bullet_num_id = register_list_numbering(doc, "bullet")
-    decimal_num_id = register_list_numbering(doc, "decimal")
+    marker_separator = _resolve_list_marker_separator(config)
+    ordered_list_style = _resolve_ordered_list_style(config)
+    unordered_list_style = _resolve_unordered_list_style(config)
+    bullet_num_id = register_list_numbering(
+        doc,
+        "bullet",
+        marker_separator=marker_separator,
+        unordered_style=unordered_list_style,
+    )
+    decimal_num_id = register_list_numbering(
+        doc,
+        "decimal",
+        marker_separator=marker_separator,
+        ordered_style=ordered_list_style,
+    )
 
     # 收集脚注定义
     footnote_defs: dict[str, str] = {}
@@ -58,6 +110,9 @@ def convert_md_to_docx(md_path: str, output_path: str,
         "decimal_num_id": decimal_num_id,
         "footnote_defs": footnote_defs,
         "md_base_path": str(md_path.parent),
+        "list_marker_separator": marker_separator,
+        "ordered_list_style": ordered_list_style,
+        "unordered_list_style": unordered_list_style,
     }
 
     for block in blocks:
@@ -151,7 +206,6 @@ def _write_table(doc, block):
                     if align and cell.paragraphs:
                         cell.paragraphs[0].alignment = align
 
-
 def _write_blockquote(doc, block, config):
     """写入引用块（支持嵌套层级，带左边框+底色）"""
     para = doc.add_paragraph()
@@ -169,16 +223,25 @@ def _write_list_item(doc, block, config, ctx):
     """写入列表项（Word 原生编号）"""
     para = doc.add_paragraph()
     # 判断有序/无序
-    is_ordered = block.list_marker and block.list_marker[-1] == '.'
+    is_ordered = _is_ordered_list_marker(block.list_marker)
     num_id = ctx["decimal_num_id"] if is_ordered else ctx["bullet_num_id"]
     apply_num_pr(para, num_id, block.list_level)
-    write_spans(para, block.spans, clear_existing=False)
+    spans = list(block.spans or [])
+    if ctx.get("list_marker_separator") == "full_space":
+        if not (
+            spans
+            and spans[0].type == InlineType.TEXT
+            and str(spans[0].text or "").startswith("\u3000")
+        ):
+            spans = [InlineSpan(InlineType.TEXT, _list_separator_text("full_space"))] + spans
+    write_spans(para, spans, clear_existing=False)
 
 
 def _write_task_list(doc, block, config):
     """写入任务清单项"""
     para = doc.add_paragraph()
-    prefix = "☑ " if block.checked else "☐ "
+    marker_separator = _resolve_list_marker_separator(config)
+    prefix = f"{'☑' if block.checked else '☐'}{_list_separator_text(marker_separator)}"
     para.add_run(prefix)
     write_spans(para, block.spans, clear_existing=False)
 

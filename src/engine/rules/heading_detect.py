@@ -29,6 +29,7 @@ _HEADING_MIN_CONF_SCORE = 1
 _TABULAR_NUMERIC_TOKEN_RE = re.compile(
     r"^[+\-]?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?%?$"
 )
+_TABULAR_CITATION_TOKEN_RE = re.compile(r"^\[\d{1,4}\]$")
 _CHAPTER_REF_RE = re.compile(r"第[一二三四五六七八九十百零\d]+章")
 _SECTION_REF_RE = re.compile(r"第[一二三四五六七八九十百零\d]+节")
 _NARRATIVE_PUNCT_RE = re.compile(r"[。；;？！?!]")
@@ -37,6 +38,19 @@ _BROKEN_TOC_BOOKMARK_HINTS = (
     "bookmark not defined",
     "\u672a\u5b9a\u4e49\u4e66\u7b7e",
 )
+_SHORT_TABULAR_LITERAL_TOKENS = {
+    "none",
+    "o2",
+    "n2",
+    "air",
+    "this work",
+    "ref",
+    "ref.",
+    "xe lamp",
+    "simulated sunlight",
+    "seawater",
+    "ethanol",
+}
 
 # Heading pattern sets (chapter -> level3), used as style-detection fallback.
 CHAPTER_PATTERNS = [
@@ -128,6 +142,57 @@ def _looks_like_tabular_numeric_line(text: str) -> bool:
     if re.search(r"[A-Za-z\u4e00-\u9fff]", "".join(tokens)):
         return False
     return (numeric_like / len(tokens)) >= 0.67
+
+
+def _looks_like_tabular_structured_line(text: str) -> bool:
+    """Guard mixed unit/citation table rows copied as paragraphs.
+
+    Example: ``41.9 mW cm-2\t1562\tthis work`` should not become a heading.
+    """
+    raw = (text or "").strip()
+    if "\t" not in raw:
+        return False
+
+    tokens = [tok.strip() for tok in raw.split("\t") if tok.strip()]
+    if len(tokens) < 2:
+        return False
+    if any(len(tok) > 80 for tok in tokens):
+        return False
+    if any(_NARRATIVE_PUNCT_RE.search(tok) for tok in tokens):
+        return False
+
+    structured = 0
+    numericish = 0
+    shortish = 0
+    for tok in tokens:
+        if len(tok) <= 24:
+            shortish += 1
+
+        low = tok.lower()
+        if _TABULAR_NUMERIC_TOKEN_RE.fullmatch(tok) or re.fullmatch(r"\d+:\d+", tok):
+            structured += 1
+            numericish += 1
+            continue
+        if _TABULAR_CITATION_TOKEN_RE.fullmatch(tok):
+            structured += 1
+            continue
+        if low in _SHORT_TABULAR_LITERAL_TOKENS:
+            structured += 1
+            continue
+
+        has_digit = bool(re.search(r"\d", tok))
+        has_unitish = bool(re.search(r"[A-Za-zµμΩωλΛ°℃/%<>=\-−]", tok))
+        if has_digit and has_unitish and len(tok) <= 32:
+            structured += 1
+            numericish += 1
+
+    if numericish <= 0:
+        return False
+    if structured >= max(2, len(tokens) - 1):
+        return True
+    if len(tokens) >= 3 and shortish >= len(tokens) - 1 and structured >= 2:
+        return True
+    return False
 
 
 def _looks_like_broken_toc_entry_line(text: str) -> bool:
@@ -251,6 +316,8 @@ def _heading_confidence_score(
         score -= 4
     if _looks_like_tabular_numeric_line(text):
         score -= 6
+    if _looks_like_tabular_structured_line(text):
+        score -= 6
     if _looks_like_broken_toc_entry_line(text):
         score -= 8
     if _looks_like_chapter_outline_sentence(text):
@@ -285,6 +352,8 @@ def _scan_heading_candidates(
         if _looks_like_date_placeholder_line(text):
             continue
         if _looks_like_tabular_numeric_line(text):
+            continue
+        if _looks_like_tabular_structured_line(text):
             continue
         if _looks_like_broken_toc_entry_line(text):
             continue
@@ -426,9 +495,12 @@ class HeadingDetectRule(BaseRule):
         non_numbered_title_norms = get_non_numbered_title_norms(config)
         front_title_norms = get_front_matter_title_norms(config)
         post_section_types = get_post_section_types(config)
+        target_indices = context.get("target_paragraph_indices")
+        if target_indices is not None:
+            target_indices = set(target_indices)
 
         # No body section -> try TOC-tail recovery first, then give up.
-        if not body:
+        if not body and not target_indices:
             toc_overreach_candidates = _scan_toc_overreach_candidates(
                 doc,
                 doc_tree,
@@ -453,9 +525,17 @@ class HeadingDetectRule(BaseRule):
             context["headings"] = headings
             return
 
-        body_indices = set(range(max(0, body.start_index), min(total - 1, body.end_index) + 1))
+        if body:
+            body_indices = set(range(max(0, body.start_index), min(total - 1, body.end_index) + 1))
+        else:
+            body_indices = set(range(total))
+        if target_indices:
+            body_indices &= target_indices
         excluded_indices = _build_excluded_indices(doc_tree, total, post_section_types)
         body_indices -= excluded_indices
+        if not body_indices:
+            context["headings"] = []
+            return
 
         # Default path: only detect inside body section (high confidence).
         primary_headings = _scan_heading_candidates(
@@ -466,9 +546,13 @@ class HeadingDetectRule(BaseRule):
         # Risk fallback: scan outside body only when section split is suspicious.
         all_indices = set(range(total))
         outside_indices = all_indices - body_indices - excluded_indices
-        fallback_candidates = _scan_heading_candidates(
-            doc, outside_indices, config, non_numbered_title_norms, front_title_norms, confidence="low"
-        )
+        if target_indices:
+            outside_indices &= target_indices
+        fallback_candidates: list[HeadingInfo] = []
+        if outside_indices and not target_indices:
+            fallback_candidates = _scan_heading_candidates(
+                doc, outside_indices, config, non_numbered_title_norms, front_title_norms, confidence="low"
+            )
         if _need_risk_fallback(body, primary_headings, fallback_candidates, total, guard):
             merged = _dedupe_headings(primary_headings + fallback_candidates)
             first_chapter_idx = next((h.para_index for h in merged if h.level == "heading1"), None)
@@ -485,7 +569,7 @@ class HeadingDetectRule(BaseRule):
                 after=f"merged={len(headings)}, fallback_used={fallback_used}",
                 paragraph_index=-1,
             )
-        elif not headings:
+        elif not headings and not target_indices:
             toc_overreach_candidates = _scan_toc_overreach_candidates(
                 doc,
                 doc_tree,

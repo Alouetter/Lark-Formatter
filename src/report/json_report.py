@@ -13,6 +13,9 @@ def generate_json_report(report: ReportData, output_path: str) -> None:
         "total_failures": report.total_failures,
         "summary": report.summary,
         "changes_by_rule": report.changes_by_rule,
+        "formula_stats": report.formula_stats,
+        "low_confidence_items": report.low_confidence_items,
+        "formula_diagnostics": report.formula_diagnostics,
         "validation_issues": report.validation_issues,
     }
     with open(output_path, "w", encoding="utf-8") as f:

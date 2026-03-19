@@ -1,8 +1,9 @@
-"""Low-risk whitespace normalization and smart full/half-width conversion."""
+"""Whitespace normalization and context-aware full/half-width conversion."""
 
 import re
 
 from docx import Document
+from docx.oxml import OxmlElement
 
 from src.engine.change_tracker import ChangeTracker
 from src.engine.rules.base import BaseRule
@@ -46,6 +47,21 @@ def _sync_xml_space_attr(t_el) -> None:
         t_el.set(key, "preserve")
     else:
         t_el.attrib.pop(key, None)
+
+
+def _replace_tab_elements_with_spaces(p_el) -> int:
+    """Convert Word native <w:tab/> nodes into literal spaces for later cleanup."""
+    changed = 0
+    for tab_el in list(p_el.findall(f".//{_w('tab')}")):
+        parent = tab_el.getparent()
+        if parent is None:
+            continue
+        t_el = OxmlElement("w:t")
+        t_el.text = " "
+        _sync_xml_space_attr(t_el)
+        parent.replace(tab_el, t_el)
+        changed += 1
+    return changed
 
 
 def _normalize_inline_text(
@@ -399,7 +415,7 @@ def _smart_full_half_convert(
 
 class WhitespaceNormalizeRule(BaseRule):
     name = "whitespace_normalize"
-    description = "空白字符统一（低风险）"
+    description = "空白与全半角规范（实验）"
 
     def apply(self, doc: Document, config: SceneConfig,
               tracker: ChangeTracker, context: dict) -> None:
@@ -454,10 +470,16 @@ class WhitespaceNormalizeRule(BaseRule):
         )):
             return
 
+        target_indices = context.get("target_paragraph_indices")
+        if target_indices is not None:
+            target_indices = set(target_indices)
+
         changed_para_count = 0
         changed_text_nodes = 0
 
         for para_idx, para in enumerate(doc.paragraphs):
+            if target_indices and para_idx not in target_indices:
+                continue
             if _is_skipped_style(para):
                 continue
 
@@ -465,11 +487,16 @@ class WhitespaceNormalizeRule(BaseRule):
             if _has_complex_content(p_el):
                 continue
 
+            para_changed = False
+            if convert_tabs:
+                converted_tabs = _replace_tab_elements_with_spaces(p_el)
+                if converted_tabs:
+                    para_changed = True
+                    changed_text_nodes += converted_tabs
+
             t_nodes = list(p_el.findall(f".//{_w('t')}"))
             if not t_nodes:
                 continue
-
-            para_changed = False
 
             # Phase 1: baseline whitespace normalization.
             for t_el in t_nodes:
@@ -495,23 +522,48 @@ class WhitespaceNormalizeRule(BaseRule):
                     or quote_by_context):
                 para_text = "".join((t.text or "") for t in t_nodes)
                 para_counts = _count_lang_chars(para_text)
-                for t_el in t_nodes:
-                    old = t_el.text or ""
-                    new = _smart_full_half_convert(
-                        old,
-                        para_counts=para_counts,
-                        min_confidence=context_min_confidence,
-                        punctuation_by_context=punctuation_by_context,
-                        bracket_by_inner_language=bracket_by_inner_language,
-                        fullwidth_alnum_to_halfwidth=fullwidth_alnum_to_halfwidth,
-                        quote_by_context=quote_by_context,
-                        protect_reference_numbering=protect_reference_numbering,
-                    )
-                    if new != old:
-                        t_el.text = new
-                        _sync_xml_space_attr(t_el)
-                        para_changed = True
-                        changed_text_nodes += 1
+                para_new = _smart_full_half_convert(
+                    para_text,
+                    para_counts=para_counts,
+                    min_confidence=context_min_confidence,
+                    punctuation_by_context=punctuation_by_context,
+                    bracket_by_inner_language=bracket_by_inner_language,
+                    fullwidth_alnum_to_halfwidth=fullwidth_alnum_to_halfwidth,
+                    quote_by_context=quote_by_context,
+                    protect_reference_numbering=protect_reference_numbering,
+                )
+                if para_new != para_text:
+                    node_lengths = [len(t_el.text or "") for t_el in t_nodes]
+                    if sum(node_lengths) == len(para_new):
+                        pos = 0
+                        for t_el, seg_len in zip(t_nodes, node_lengths):
+                            old = t_el.text or ""
+                            new = para_new[pos:pos + seg_len]
+                            pos += seg_len
+                            if new != old:
+                                t_el.text = new
+                                _sync_xml_space_attr(t_el)
+                                para_changed = True
+                                changed_text_nodes += 1
+                    else:
+                        # Defensive fallback for future non-length-preserving rules.
+                        for t_el in t_nodes:
+                            old = t_el.text or ""
+                            new = _smart_full_half_convert(
+                                old,
+                                para_counts=para_counts,
+                                min_confidence=context_min_confidence,
+                                punctuation_by_context=punctuation_by_context,
+                                bracket_by_inner_language=bracket_by_inner_language,
+                                fullwidth_alnum_to_halfwidth=fullwidth_alnum_to_halfwidth,
+                                quote_by_context=quote_by_context,
+                                protect_reference_numbering=protect_reference_numbering,
+                            )
+                            if new != old:
+                                t_el.text = new
+                                _sync_xml_space_attr(t_el)
+                                para_changed = True
+                                changed_text_nodes += 1
 
             # Phase 3: trim paragraph edges.
             if trim_paragraph_edges and _trim_paragraph_edges(t_nodes):

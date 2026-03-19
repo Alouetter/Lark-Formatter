@@ -1,11 +1,11 @@
 """页面设置规则"""
 
-from lxml import etree
 from docx import Document
 from docx.shared import Cm
 from src.engine.rules.base import BaseRule, ValidationIssue
 from src.engine.change_tracker import ChangeTracker
-from src.scene.schema import SceneConfig, StyleConfig
+from src.engine.rules.header_footer import _apply_part_style
+from src.scene.schema import SceneConfig
 from src.utils.constants import CM_TO_TWIPS
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -18,32 +18,6 @@ _PAPER_SIZE_CM = {
 
 def _w(tag: str) -> str:
     return f"{{{_W_NS}}}{tag}"
-
-
-def _format_hf_runs(element, sc: StyleConfig):
-    """格式化页眉/页脚中所有 run 的字体和字号"""
-    size_half_pt = str(int(sc.size_pt * 2))
-    for r in element.iter(_w("r")):
-        rPr = r.find(_w("rPr"))
-        if rPr is None:
-            rPr = etree.SubElement(r, _w("rPr"))
-            r.insert(0, rPr)
-        rf = rPr.find(_w("rFonts"))
-        if rf is None:
-            rf = etree.SubElement(rPr, _w("rFonts"))
-        rf.set(_w("ascii"), sc.font_en)
-        rf.set(_w("hAnsi"), sc.font_en)
-        rf.set(_w("eastAsia"), sc.font_cn)
-        for attr in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme"):
-            rf.attrib.pop(_w(attr), None)
-        sz = rPr.find(_w("sz"))
-        if sz is None:
-            sz = etree.SubElement(rPr, _w("sz"))
-        sz.set(_w("val"), size_half_pt)
-        szCs = rPr.find(_w("szCs"))
-        if szCs is None:
-            szCs = etree.SubElement(rPr, _w("szCs"))
-        szCs.set(_w("val"), size_half_pt)
 
 
 class PageSetupRule(BaseRule):
@@ -104,7 +78,7 @@ class PageSetupRule(BaseRule):
                 if r_id and header_sc:
                     try:
                         part = doc.part.related_parts[r_id]
-                        _format_hf_runs(part.element, header_sc)
+                        _apply_part_style(part.element, header_sc, default_alignment="center")
                         count += 1
                     except (KeyError, AttributeError):
                         pass
@@ -115,7 +89,7 @@ class PageSetupRule(BaseRule):
                 if r_id and footer_sc:
                     try:
                         part = doc.part.related_parts[r_id]
-                        _format_hf_runs(part.element, footer_sc)
+                        _apply_part_style(part.element, footer_sc, default_alignment="center")
                         count += 1
                     except (KeyError, AttributeError):
                         pass

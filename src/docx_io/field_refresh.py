@@ -201,6 +201,38 @@ finally:
 """
 
 
+def _atomic_copy_back(src_path: Path, target_path: Path) -> None:
+    """Copy via a sibling temp file and atomically replace the target."""
+    target = Path(target_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+
+        shutil.copy2(src_path, temp_path)
+        try:
+            with open(temp_path, "rb") as handle:
+                os.fsync(handle.fileno())
+        except OSError:
+            pass
+        os.replace(temp_path, target)
+    except Exception:
+        if temp_path is not None:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception:
+                pass
+        raise
+
+
 def _refresh_via_pywin32(doc_path: Path, timeout_sec: int) -> tuple[bool, str]:
     """Run pywin32 refresh in a child process to avoid hanging UI thread."""
     if getattr(sys, "frozen", False):
@@ -302,7 +334,7 @@ def refresh_doc_fields_with_word(doc_path: str, timeout_sec: int = 10) -> tuple[
         ok, detail = _refresh_via_pywin32(shadow, timeout_sec)
         if ok:
             try:
-                shutil.copy2(shadow, p)
+                _atomic_copy_back(shadow, p)
                 return True, detail
             except Exception as exc:
                 return False, f"Refreshed on shadow but failed to write back: {exc}"
@@ -310,7 +342,7 @@ def refresh_doc_fields_with_word(doc_path: str, timeout_sec: int = 10) -> tuple[
         ok_ps, detail_ps = _refresh_via_powershell(shadow, timeout_sec)
         if ok_ps:
             try:
-                shutil.copy2(shadow, p)
+                _atomic_copy_back(shadow, p)
                 return True, detail_ps
             except Exception as exc:
                 return False, f"Refreshed on shadow but failed to write back: {exc}"

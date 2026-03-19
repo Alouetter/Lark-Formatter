@@ -6,7 +6,13 @@ from docx import Document
 from docx.shared import Pt, Cm, Emu
 from src.engine.rules.base import BaseRule
 from src.engine.change_tracker import ChangeTracker
+from src.formula_core.normalize import (
+    looks_like_bibliographic_reference_text,
+    looks_like_caption_text,
+    looks_like_formula_text,
+)
 from src.scene.schema import SceneConfig
+from src.utils.ooxml import apply_explicit_rfonts
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
@@ -16,6 +22,8 @@ _A4_WIDTH_TWIPS = 11906  # 21cm ≈ 11906 twips
 
 # 每列最小宽度（twips），约 1.5cm
 _MIN_COL_WIDTH = 850
+# 公式表格在“右侧仅占位且无编号”时的最小压缩宽度（twips）
+_MIN_EQ_PLACEHOLDER_COL_WIDTH = 220
 
 # 单元格左右内边距合计（twips），Word 默认约 108*2
 _CELL_PADDING = 216
@@ -30,14 +38,14 @@ def _w(tag: str) -> str:
 
 
 _RE_EQ_NUM = re.compile(
-    r'^\s*(?:[\.．…·•]{2,}\s*)?[\(（]\s*\d+(?:[\-\.]\d+)+\s*[\)）]\s*$'
+    r'^\s*(?:[\.．…·•]{2,}\s*)?[\(（]\s*\d+(?:[\-\.]\d+)?\s*[\)）]\s*$'
 )
 _RE_EQ_NUM_SUFFIX = re.compile(
-    r'^(?P<prefix>.*?)(?:[\.．…·•]{2,}\s*)?[\(（]\s*\d+(?:[\-\.]\d+)+\s*[\)）]\s*$'
+    r'^(?P<prefix>.*?)(?:[\.．…·•]{2,}\s*)?[\(（]\s*\d+(?:[\-\.]\d+)?\s*[\)）]\s*$'
 )
-_RE_EQ_NUM_TAIL = re.compile(r'[\(（]\s*(\d+(?:[\-\.]\d+)+)\s*[\)）]\s*$')
+_RE_EQ_NUM_TAIL = re.compile(r'[\(（]\s*(\d+(?:[\-\.]\d+)?)\s*[\)）]\s*$')
 _RE_EQ_NUM_LOOSE = re.compile(
-    r'^\s*(?:[\.．…·•]{2,}\s*)?(?:[\(（]\s*)?(\d+(?:[\-\.]\d+)+)\s*(?:[\)）])?\s*$'
+    r'^\s*(?:[\.．…·•]{2,}\s*)?(?:[\(（]\s*)?(\d+(?:[\-\.]\d+)?)\s*(?:[\)）])?\s*$'
 )
 _RE_EQ_ARROW = re.compile(r'(→|←|↔|⇌|->|<-|<->)')
 _RE_HEADER_TRAILING_UNIT = re.compile(
@@ -46,25 +54,102 @@ _RE_HEADER_TRAILING_UNIT = re.compile(
 _RE_TRAILING_PAREN_CHUNK = re.compile(
     r'^(?P<head>.+?)(?P<paren>[（(][^()（）]{1,80}[）)])\s*$'
 )
+_RE_CJK_TEXT = re.compile(r"[\u4e00-\u9fff]")
+_RE_PROSE_PUNCT = re.compile(r"[，。；：！？、]")
+_RE_COMPACT_FORMULA_PREFIX = re.compile(r"^[A-Za-zΑ-Ωα-ω0-9\s()+\-*/^_\\{}\[\].,]+$")
+_RE_COMPACT_PLUS_TIMES_EXPR = re.compile(
+    r"[A-Za-zΑ-Ωα-ω0-9\)\]}]\s*[+*]\s*[A-Za-zΑ-Ωα-ω0-9\(\[{\\]"
+)
+_RE_COMPACT_SLASH_EXPR = re.compile(
+    r"[A-Za-zΑ-Ωα-ω0-9\)\]}]\s*/\s*[A-Za-zΑ-Ωα-ω0-9\(\[{\\]"
+)
+_RE_OMML_FORMULA_ANCHOR = re.compile(r"(=|≈|≠|≤|≥|∑|∫|∏|√|→|←|↔|⇌|±|∂)")
 _MAX_EQ_TABLE_ROWS = 20
 
 
 def _get_cell_text(tc) -> str:
-    """提取单元格纯文本"""
+    """提取单元格纯文本，保留 tab/换行等文本边界。"""
     parts = []
     for p in tc.findall(_w("p")):
         for r in p.findall(_w("r")):
-            t = r.find(_w("t"))
-            if t is not None and t.text:
-                parts.append(t.text)
+            for child in r:
+                local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                if local == "t" and child.text:
+                    parts.append(child.text)
+                elif local == "tab":
+                    parts.append("\t")
+                elif local in {"br", "cr"}:
+                    parts.append("\n")
     return "".join(parts)
+
+
+def _cell_has_math_content(tc) -> bool:
+    """判断单元格是否包含 Word 数学对象（OMML）。"""
+    if tc.findall(f".//{{{_M_NS}}}oMath"):
+        return True
+    if tc.findall(f".//{{{_M_NS}}}oMathPara"):
+        return True
+    return False
+
+
+def _extract_cell_omml_linear_text(tc) -> str:
+    return "".join(
+        tc.xpath(".//*[namespace-uri()='%s' and local-name()='t']/text()" % _M_NS)
+    ).strip()
+
+
+def _cell_omml_is_prose_like(tc) -> bool:
+    linear = _extract_cell_omml_linear_text(tc)
+    if not linear:
+        return False
+    if looks_like_caption_text(linear):
+        return True
+    if looks_like_bibliographic_reference_text(linear):
+        return True
+    if len(linear) > 240:
+        return True
+    if _RE_OMML_FORMULA_ANCHOR.search(linear):
+        return False
+
+    chinese_count = len(_RE_CJK_TEXT.findall(linear))
+    prose_punct_count = len(_RE_PROSE_PUNCT.findall(linear))
+    matched, conf, _ = looks_like_formula_text(linear)
+    if matched and float(conf) >= 0.78 and chinese_count <= max(2, int(len(linear) * 0.12)):
+        return False
+
+    if chinese_count >= max(6, int(len(linear) * 0.16)) and prose_punct_count >= 1:
+        return True
+    if chinese_count >= max(12, int(len(linear) * 0.28)):
+        return True
+    if any(
+        marker in linear
+        for marker in ("体积比为", "混合液中", "搅拌", "透析", "分别得到", "分别表示", "其中，")
+    ):
+        return True
+    return False
+
+
+def _cell_has_formula_math_anchor(tc) -> bool:
+    if not _cell_has_math_content(tc):
+        return False
+    return not _cell_omml_is_prose_like(tc)
+
+
+def _cell_has_equation_object(tc) -> bool:
+    """判断单元格是否包含疑似公式 OLE 对象（MathType/Equation）。"""
+    for obj in tc.findall(f".//{{{_W_NS}}}object"):
+        try:
+            raw = etree.tostring(obj, encoding="unicode").lower()
+        except Exception:
+            raw = ""
+        if "equation" in raw or "mathtype" in raw:
+            return True
+    return False
 
 
 def _cell_has_non_text_content(tc) -> bool:
     """判断单元格是否含公式/对象等非文本内容。"""
-    if tc.findall(f".//{{{_M_NS}}}oMath"):
-        return True
-    if tc.findall(f".//{{{_M_NS}}}oMathPara"):
+    if _cell_has_math_content(tc):
         return True
     if tc.findall(f".//{{{_W_NS}}}object"):
         return True
@@ -72,6 +157,18 @@ def _cell_has_non_text_content(tc) -> bool:
         return True
     if tc.findall(f".//{{{_W_NS}}}pict"):
         return True
+    return False
+
+
+def _table_has_drawing_or_object(tbl_el) -> bool:
+    """Skip non-regular tables that embed pictures/objects (e.g. icon badges)."""
+    for tc in tbl_el.iter(_w("tc")):
+        if tc.findall(f".//{{{_W_NS}}}object"):
+            return True
+        if tc.findall(f".//{{{_W_NS}}}drawing"):
+            return True
+        if tc.findall(f".//{{{_W_NS}}}pict"):
+            return True
     return False
 
 
@@ -88,13 +185,44 @@ def _iter_cell_paragraphs(tc):
 
 def _looks_like_formula_prefix(prefix: str) -> bool:
     """判断编号前缀是否像公式表达式（覆盖“表达式+(2.8)”同格场景）。"""
-    if not prefix:
+    value = (prefix or "").strip()
+    if not value:
         return False
-    if re.search(r'(=|→|←|↔|->|<-|<->)', prefix):
+
+    if looks_like_caption_text(value):
+        return False
+
+    chinese_count = len(_RE_CJK_TEXT.findall(value))
+    if chinese_count:
+        if _RE_PROSE_PUNCT.search(value):
+            return False
+        if chinese_count > max(2, int(len(value) * 0.18)):
+            return False
+
+    if re.search(r'(=|→|←|↔|->|<-|<->)', value):
         return True
-    # 连字符/斜杠常见于样品名和单位；仅将 +/* 作为弱公式信号
-    op_count = len(re.findall(r'[+*/]', prefix))
-    return op_count >= 1 and bool(re.search(r'[A-Za-zΑ-Ωα-ω]', prefix))
+
+    matched, conf, _ = looks_like_formula_text(value)
+
+    if value.startswith("\\") and matched:
+        return float(conf) >= 0.60
+
+    if any(ch in value for ch in ("^", "_", "{", "}")) and matched:
+        return float(conf) >= 0.60
+
+    if not _RE_COMPACT_FORMULA_PREFIX.fullmatch(value):
+        return False
+
+    if _RE_COMPACT_PLUS_TIMES_EXPR.search(value):
+        return True
+
+    # Bare slash is too noisy for chemistry labels/solvent ratios such as CCl4/H2O.
+    # Only accept slash-driven same-cell renumbering when grouping makes it look
+    # like a compact fraction/expression rather than a sample or solvent name.
+    if "/" in value and re.search(r"[(){}\[\]]", value):
+        return bool(_RE_COMPACT_SLASH_EXPR.search(value))
+
+    return False
 
 
 def _looks_like_equation_text(text: str) -> bool:
@@ -112,46 +240,108 @@ def _looks_like_equation_text(text: str) -> bool:
     return False
 
 
-def _is_equation_table(tbl_el) -> bool:
-    """Detect equation-table by first row only.
+def _looks_like_formula_cell_text(text: str) -> bool:
+    """Conservative text-only formula detector for equation-table heuristics."""
+    s = (text or "").strip()
+    if not s:
+        return False
+    if looks_like_caption_text(s):
+        return False
+    if _looks_like_equation_text(s):
+        return True
 
-    Constraint:
-    - Only first row participates in table-level equation detection.
-    - Any rows after first row are ignored for this decision.
-    """
+    matched, conf, _ = looks_like_formula_text(s)
+    if not matched:
+        return False
+
+    if s.startswith("\\"):
+        return float(conf) >= 0.60
+
+    if float(conf) >= 0.72:
+        return True
+
+    return False
+
+
+def _analyze_text_only_equation_row(cell_texts: list[str]) -> dict[str, object]:
+    last_idx = len(cell_texts) - 1
+    equation_like_indices: list[int] = []
+    other_text_indices: list[int] = []
+
+    for idx, txt in enumerate(cell_texts):
+        value = (txt or "").strip()
+        if not value:
+            continue
+        if _extract_equation_number_id(value):
+            continue
+        if _looks_like_formula_cell_text(value):
+            equation_like_indices.append(idx)
+        else:
+            other_text_indices.append(idx)
+
+    only_trailing_other_text = bool(other_text_indices) and all(
+        idx == last_idx for idx in other_text_indices
+    )
+    trailing_slot_available = False
+    if last_idx >= 0:
+        last_text = (cell_texts[last_idx] or "").strip()
+        trailing_slot_available = (not last_text) or bool(_extract_equation_number_id(last_text))
+
+    return {
+        "equation_like_indices": equation_like_indices,
+        "other_text_indices": other_text_indices,
+        "only_trailing_other_text": only_trailing_other_text,
+        "trailing_slot_available": trailing_slot_available,
+        "is_formula_anchor_row": (
+            equation_like_indices == [0]
+            and (
+                not other_text_indices
+                or only_trailing_other_text
+            )
+        ),
+    }
+
+
+def _is_equation_table(tbl_el) -> bool:
+    """Detect equation-table with conservative text-only heuristics."""
     rows = tbl_el.findall(_w("tr"))
     if not rows or len(rows) > _MAX_EQ_TABLE_ROWS:
         return False
 
-    first_row = rows[0]
-    cells = first_row.findall(_w("tc"))
-    if not cells:
-        return False
-
-    # First row has equation objects / math objects.
-    if any(_cell_has_non_text_content(tc) for tc in cells):
-        return True
-
-    cell_texts = [(_get_cell_text(tc) or "").strip() for tc in cells]
-    non_empty = [txt for txt in cell_texts if txt]
-    if not non_empty:
-        return False
-
-    # Right-most pure equation id, e.g. "(3.2)".
-    for txt in reversed(cell_texts):
-        if txt and _RE_EQ_NUM.match(txt):
+    formula_anchor_rows = 0
+    trailing_slot_rows = 0
+    for tr in rows:
+        row_cells = tr.findall(_w("tc"))
+        if not row_cells:
+            continue
+        row_texts = [(_get_cell_text(tc) or "").strip() for tc in row_cells]
+        has_math_anchor = any(
+            _cell_has_formula_math_anchor(tc) or _cell_has_equation_object(tc)
+            for tc in row_cells
+        )
+        has_pure_number_cell = any(
+            txt and _RE_EQ_NUM.match(txt)
+            for txt in row_texts
+        )
+        right_non_empty = next((txt for txt in reversed(row_texts) if txt), "")
+        if right_non_empty:
+            m = _RE_EQ_NUM_SUFFIX.match(right_non_empty)
+            if m and _looks_like_formula_prefix(m.group("prefix")):
+                return True
+        profile = _analyze_text_only_equation_row(row_texts)
+        row_has_formula_anchor = has_math_anchor or bool(
+            profile.get("is_formula_anchor_row")
+        )
+        if row_has_formula_anchor and (
+            profile.get("trailing_slot_available") or has_pure_number_cell
+        ):
             return True
+        if row_has_formula_anchor:
+            formula_anchor_rows += 1
+        if profile.get("trailing_slot_available") or has_pure_number_cell:
+            trailing_slot_rows += 1
 
-    # Same-cell expression + id, e.g. "A + B -> C ...(3.2)".
-    right_non_empty = next((txt for txt in reversed(cell_texts) if txt), "")
-    if right_non_empty:
-        m = _RE_EQ_NUM_SUFFIX.match(right_non_empty)
-        if m and _looks_like_formula_prefix(m.group("prefix")):
-            return True
-
-    # First-row equation-like text (no id case).
-    merged = " ".join(txt for txt in non_empty if not _RE_EQ_NUM.match(txt))
-    if merged and _looks_like_equation_text(merged):
+    if formula_anchor_rows >= 2 and trailing_slot_rows >= 1:
         return True
 
     return False
@@ -181,11 +371,20 @@ def _get_chapter_num(para_index: int, chapter_ranges) -> int:
 
 
 def _extract_equation_number_id(text: str) -> str | None:
-    """提取文本末尾的公式编号主体（如 3.2 / 2-8）。"""
+    """提取文本末尾的公式编号主体（如 3.2 / 2-8 / 3）。"""
     m = _RE_EQ_NUM_TAIL.search((text or "").strip())
     if not m:
         return None
     return m.group(1)
+
+
+def _extract_equation_number_display(text: str) -> str | None:
+    """Extract the tail number display and preserve original bracket shape."""
+    m = _RE_EQ_NUM_TAIL.search((text or "").strip())
+    if not m:
+        return None
+    # Keep full/half-width bracket style for width estimation; strip inner spaces.
+    return re.sub(r"\s+", "", m.group(0))
 
 
 def _parse_chapter_seq(number_id: str) -> tuple[int, int] | None:
@@ -228,8 +427,8 @@ def _is_equation_row(tr) -> bool:
     if not cells:
         return False
 
-    # 含公式对象/图元对象时直接视为公式行
-    if any(_cell_has_non_text_content(tc) for tc in cells):
+    # 含公式对象时直接视为公式行
+    if any(_cell_has_formula_math_anchor(tc) or _cell_has_equation_object(tc) for tc in cells):
         return True
 
     cell_texts = [(_get_cell_text(tc) or "").strip() for tc in cells]
@@ -242,15 +441,11 @@ def _is_equation_row(tr) -> bool:
         if _extract_equation_number_id(txt):
             return True
 
-    merged = " ".join(txt for txt in non_empty if not _RE_EQ_NUM.match(txt))
-    if not merged:
-        return False
-    if _looks_like_equation_text(merged):
-        return True
-
-    # 在“已判定为公式表格”的上下文中，放宽一档：
-    # 有反应/运算符并伴随拉丁字母或 * 时，通常仍是公式/反应式。
-    if re.search(r'[=→←↔⇌+\-−*/]', merged) and re.search(r'[A-Za-zΑ-Ωα-ω*]', merged):
+    profile = _analyze_text_only_equation_row(cell_texts)
+    if (
+        profile.get("is_formula_anchor_row")
+        and profile.get("trailing_slot_available")
+    ):
         return True
     return False
 
@@ -276,12 +471,40 @@ def _set_cell_plain_text(tc, text: str) -> None:
         text_nodes[0].text = text
         for t in text_nodes[1:]:
             t.text = ""
+        for r in tc.iter(_w("r")):
+            for child in list(r):
+                local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                if local in {"tab", "br", "cr"}:
+                    r.remove(child)
         return
     paras = tc.findall(_w("p"))
     p = paras[0] if paras else etree.SubElement(tc, _w("p"))
     r = etree.SubElement(p, _w("r"))
     t = etree.SubElement(r, _w("t"))
     t.text = text
+
+
+def _strip_equation_number_tail_from_cell(tc) -> bool:
+    """Remove a same-cell trailing equation number while preserving non-text content."""
+    text = _get_cell_text(tc)
+    if not text:
+        return False
+    match = _RE_EQ_NUM_TAIL.search(text)
+    if not match:
+        return False
+    prefix = text[:match.start()].rstrip()
+    text_nodes = tc.findall(f".//{_w('t')}")
+    if not text_nodes:
+        return False
+    text_nodes[0].text = prefix
+    for t in text_nodes[1:]:
+        t.text = ""
+    for r in tc.iter(_w("r")):
+        for child in list(r):
+            local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if local in {"tab", "br", "cr"}:
+                r.remove(child)
+    return True
 
 
 def _cell_has_rich_run_typography(tc) -> bool:
@@ -291,22 +514,51 @@ def _cell_has_rich_run_typography(tc) -> bool:
     rewriting with plain text would lose typography.
     """
     runs = list(tc.iter(_w("r")))
-    non_empty_runs = 0
+    signatures = []
     for r in runs:
         txt = "".join((t.text or "") for t in r.findall(_w("t")))
-        if txt:
-            non_empty_runs += 1
+        if not txt:
+            continue
         rPr = r.find(_w("rPr"))
         if rPr is None:
+            signatures.append((False, False, "", False, False))
             continue
+
+        def _onoff(local: str) -> bool:
+            node = rPr.find(_w(local))
+            if node is None:
+                return False
+            val = (node.get(_w("val")) or "").strip().lower()
+            return val not in {"0", "false", "off", "none"}
+
         va = rPr.find(_w("vertAlign"))
         if va is not None:
             val = (va.get(_w("val")) or "").strip()
             if val in {"subscript", "superscript"}:
                 return True
-    # More than one non-empty run usually means mixed inline styling;
-    # avoid flattening to keep original typography.
-    return non_empty_runs > 1
+
+        pos = rPr.find(_w("position"))
+        pos_val = (pos.get(_w("val")) or "").strip() if pos is not None else ""
+        if pos_val not in {"", "0"}:
+            return True
+
+        underline = rPr.find(_w("u"))
+        underline_val = ""
+        if underline is not None:
+            underline_val = (underline.get(_w("val")) or "").strip().lower() or "single"
+            if underline_val == "none":
+                underline_val = ""
+
+        signatures.append(
+            (
+                _onoff("b") or _onoff("bCs"),
+                _onoff("i") or _onoff("iCs"),
+                underline_val,
+                _onoff("strike") or _onoff("dstrike"),
+                _onoff("caps") or _onoff("smallCaps"),
+            )
+        )
+    return len(set(signatures)) > 1
 
 
 def _cell_safe_for_plain_text_rewrite(tc) -> bool:
@@ -424,6 +676,41 @@ def _set_grid_cols(tbl_el, widths: list[int]):
     for w in widths:
         col = etree.SubElement(grid, _w("gridCol"))
         col.set(_w("w"), str(w))
+
+
+def top_level_table_anchor_positions(doc: Document) -> list[int]:
+    """Map each top-level table to a nearby paragraph index.
+
+    The default python-docx table order follows the top-level ``w:tbl`` order in
+    ``document.xml``. For most tables, the nearest preceding paragraph is the
+    most stable anchor. For leading tables that appear before the first
+    paragraph (common on thesis covers), prefer the first following paragraph so
+    they inherit the cover/front-matter scope instead of being forced onto
+    paragraph ``0``.
+
+    Returns ``-1`` only when the document has no paragraph to anchor to.
+    """
+    positions: list[int] = []
+    pending_leading_tables = 0
+    para_idx = -1
+
+    for child in doc.element.body:
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if tag == "p":
+            para_idx += 1
+            if pending_leading_tables > 0:
+                positions.extend([para_idx] * pending_leading_tables)
+                pending_leading_tables = 0
+        elif tag == "tbl":
+            if para_idx >= 0:
+                positions.append(para_idx)
+            else:
+                pending_leading_tables += 1
+
+    if pending_leading_tables > 0:
+        positions.extend([-1] * pending_leading_tables)
+
+    return positions
 
 
 def _analyze_col_weights(tbl_el, num_grid_cols: int) -> list[float]:
@@ -1090,6 +1377,11 @@ def _set_table_alignment(tbl_el, align: str):
     jc.set(_w("val"), align)
 
 
+def _normalize_horizontal_alignment(value: str | None, *, default: str = "center") -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in {"left", "center", "right", "justify"} else default
+
+
 def _target_normal_table_width(
         avail_w: int,
         num_cols: int,
@@ -1270,6 +1562,11 @@ def _format_cell_fonts(tbl_el, font_cn, font_en, size_pt):
             rf = rPr.find(_w("rFonts"))
             if rf is None:
                 rf = etree.SubElement(rPr, _w("rFonts"))
+            apply_explicit_rfonts(
+                rPr,
+                font_cn=font_cn,
+                font_en=font_en,
+            )
             rf.set(_w("ascii"), font_en)
             rf.set(_w("hAnsi"), font_en)
             rf.set(_w("eastAsia"), font_cn)
@@ -1461,18 +1758,34 @@ def _format_cell_paragraphs(tbl_el, line_spacing_mode: str = "single"):
 
 
 def _normalize_equation_number_text(text: str) -> str | None:
-    """将公式编号规范为 (x.y)/(x-y) 形式；不匹配则返回 None。"""
+    """将公式编号规范为 (x.y) / (x-y) 形式；保留原有分隔符。"""
     m = _RE_EQ_NUM_LOOSE.match(text or "")
     if not m:
         return None
-    return f"({m.group(1)})"
+    number_id = m.group(1)
+    return f"({number_id})"
 
 
-def _format_equation_number_cell(tc):
-    """格式化公式表格右侧编号单元格：括号、右对齐、TNR 10.5pt。"""
+def _format_equation_number_cell(
+        tc,
+        *,
+        alignment: str = "right",
+        font_name: str = "Times New Roman",
+        font_size_pt: float = 10.5):
+    """格式化公式表格右侧编号单元格：括号、对齐、字体/字号。"""
     normalized = _normalize_equation_number_text(_get_cell_text(tc))
     if normalized is None:
         return
+
+    target_alignment = _normalize_horizontal_alignment(alignment, default="right")
+    target_font_name = str(font_name or "").strip() or "Times New Roman"
+    try:
+        target_font_size_pt = float(font_size_pt)
+    except (TypeError, ValueError):
+        target_font_size_pt = 10.5
+    if target_font_size_pt <= 0:
+        target_font_size_pt = 10.5
+    target_size_half_pt = str(max(1, int(round(target_font_size_pt * 2))))
 
     # 统一文本为规范编号（避免出现无括号或全角括号的情况）
     text_nodes = tc.findall(f".//{_w('t')}")
@@ -1496,12 +1809,29 @@ def _format_equation_number_cell(tc):
         if pPr is None:
             pPr = etree.SubElement(p, _w("pPr"))
             p.insert(0, pPr)
+
+        # 清理缩进，避免模板/样式继承导致编号列有效宽度变窄而被换行。
+        ind = pPr.find(_w("ind"))
+        if ind is None:
+            ind = etree.SubElement(pPr, _w("ind"))
+        for attr in (
+            "left",
+            "leftChars",
+            "right",
+            "rightChars",
+            "firstLine",
+            "firstLineChars",
+            "hanging",
+            "hangingChars",
+        ):
+            ind.set(_w(attr), "0")
+
         jc = pPr.find(_w("jc"))
         if jc is None:
             jc = etree.SubElement(pPr, _w("jc"))
-        jc.set(_w("val"), "right")
+        jc.set(_w("val"), target_alignment)
 
-    # 编号字体：Times New Roman 10.5pt（五号）
+    # 编号字体/字号
     for r in tc.iter(_w("r")):
         rPr = r.find(_w("rPr"))
         if rPr is None:
@@ -1510,9 +1840,15 @@ def _format_equation_number_cell(tc):
         rf = rPr.find(_w("rFonts"))
         if rf is None:
             rf = etree.SubElement(rPr, _w("rFonts"))
-        rf.set(_w("ascii"), "Times New Roman")
-        rf.set(_w("hAnsi"), "Times New Roman")
-        rf.set(_w("eastAsia"), "Times New Roman")
+        apply_explicit_rfonts(
+            rPr,
+            font_cn=target_font_name,
+            font_en=target_font_name,
+            font_cs=target_font_name,
+        )
+        rf.set(_w("ascii"), target_font_name)
+        rf.set(_w("hAnsi"), target_font_name)
+        rf.set(_w("eastAsia"), target_font_name)
         for attr in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme"):
             rf.attrib.pop(_w(attr), None)
 
@@ -1520,7 +1856,7 @@ def _format_equation_number_cell(tc):
             sz = rPr.find(_w(sz_tag))
             if sz is None:
                 sz = etree.SubElement(rPr, _w(sz_tag))
-            sz.set(_w("val"), "21")  # 10.5pt = 21 half-points
+            sz.set(_w("val"), target_size_half_pt)
 
 
 def _set_tc_borders_none(tcPr) -> None:
@@ -1563,13 +1899,37 @@ def _set_table_fixed_layout(tbl_el) -> None:
 
 def _equation_number_col_target_width(tbl_el, total_w: int) -> int:
     """估算公式表格右侧编号列目标宽度（仅容纳“(3.2)”这类编号）。"""
-    target = _text_width_twips("(3.2)")
+    target = max(_text_width_twips("(3.2)"), _text_width_twips("（3.2）"))
+    has_number = False
 
     for tr in tbl_el.findall(_w("tr")):
-        number_id, _, _ = _find_existing_equation_number_in_row(tr)
+        number_id, _, number_cell = _find_existing_equation_number_in_row(tr)
         if not number_id:
             continue
-        target = max(target, _text_width_twips(f"({number_id})"))
+        has_number = True
+        display = None
+        if number_cell is not None:
+            display = _extract_equation_number_display(_get_cell_text(number_cell))
+        if display:
+            target = max(target, _text_width_twips(display))
+        else:
+            target = max(target, _text_width_twips(f"({number_id})"))
+
+    # 新生成的公式表格在“右列空占位”场景下，允许极限压缩右列，
+    # 避免左侧公式显示在页面偏左位置。
+    if not has_number:
+        rows = tbl_el.findall(_w("tr"))
+        right_cells = []
+        for tr in rows:
+            cells = tr.findall(_w("tc"))
+            if cells:
+                right_cells.append(cells[-1])
+        if right_cells and all(_cell_is_effectively_empty(tc) for tc in right_cells):
+            # 约 0.4~0.7cm：足够占位，后续若插入编号可再按编号内容扩展。
+            return max(
+                _MIN_EQ_PLACEHOLDER_COL_WIDTH,
+                min(int(total_w * 0.06), max(int(total_w * 0.03), _MIN_EQ_PLACEHOLDER_COL_WIDTH)),
+            )
 
     # 预留少量安全余量，并限制编号列不应过宽
     target += 80
@@ -1620,12 +1980,24 @@ def _shrink_equation_number_column(tbl_el, total_w: int) -> None:
     _set_table_fixed_layout(tbl_el)
 
 
-def _format_equation_table(tbl_el, total_w: int | None = None) -> int:
+def _format_equation_table(
+        tbl_el,
+        total_w: int | None = None,
+        *,
+        table_alignment: str = "center",
+        formula_cell_alignment: str = "center",
+        number_alignment: str = "right",
+        number_font_name: str = "Times New Roman",
+        number_font_size_pt: float = 10.5,
+        auto_shrink_number_column: bool = True) -> int:
     """公式表格样式：无边框，单元格纵向居中，纯编号单元格右对齐+TNR 10.5pt。
 
     返回值：本次格式化到的纯编号单元格数量。
     """
     formatted_number_cells = 0
+    table_alignment = _normalize_horizontal_alignment(table_alignment, default="center")
+    formula_cell_alignment = _normalize_horizontal_alignment(formula_cell_alignment, default="center")
+    number_alignment = _normalize_horizontal_alignment(number_alignment, default="right")
     tblPr = tbl_el.find(_w("tblPr"))
     if tblPr is None:
         tblPr = etree.SubElement(tbl_el, _w("tblPr"))
@@ -1656,26 +2028,33 @@ def _format_equation_table(tbl_el, total_w: int | None = None) -> int:
             vAlign = etree.SubElement(tcPr, _w("vAlign"))
         vAlign.set(_w("val"), "center")
 
+    _set_table_alignment(tbl_el, table_alignment)
+
     # 若给定总可用宽度，压缩最右编号列宽度
-    if total_w is not None and total_w > 0:
+    if auto_shrink_number_column and total_w is not None and total_w > 0:
         _shrink_equation_number_column(tbl_el, total_w)
 
     # 逐行规范纯编号单元格，并将左侧公式单元格居中（避免仅处理首行）
     for tr in tbl_el.findall(_w("tr")):
         _, pure_number_cell, matched_cell = _find_existing_equation_number_in_row(tr)
         if pure_number_cell is not None:
-            _format_equation_number_cell(pure_number_cell)
+            _format_equation_number_cell(
+                pure_number_cell,
+                alignment=number_alignment,
+                font_name=number_font_name,
+                font_size_pt=number_font_size_pt,
+            )
             formatted_number_cells += 1
         elif matched_cell is not None:
             # 兼容“表达式+(编号)同格”场景：纯文本单元格靠右；
             # 含公式/对象时避免强制改对齐，防止公式显示异常。
             if _cell_safe_for_plain_text_rewrite(matched_cell):
-                _set_cell_paragraph_align(matched_cell, "right")
+                _set_cell_paragraph_align(matched_cell, number_alignment)
 
         for tc in tr.findall(_w("tc")):
             if tc is pure_number_cell or tc is matched_cell:
                 continue
-            _set_cell_paragraph_align(tc, "center")
+            _set_cell_paragraph_align(tc, formula_cell_alignment)
 
     return formatted_number_cells
 
@@ -1758,30 +2137,44 @@ class TableFormatRule(BaseRule):
         border_applied_count = 0
         header_unit_break_count = 0
         body_paren_break_count = 0
-
+        rich_content_table_skip_count = 0
         # 获取正文分区边界，仅格式化正文区域内的表格
         body_range = None
+        target_indices = context.get("target_paragraph_indices")
+        if target_indices is not None:
+            target_indices = set(target_indices)
         doc_tree = context.get("doc_tree")
+        has_doc_tree_scope = bool(getattr(doc_tree, "sections", None))
         if doc_tree:
             body_sec = doc_tree.get_section("body")
             if body_sec:
                 start, end = body_sec.start_index, body_sec.end_index
                 # 某些前置规则可能改动段落结构，导致 doc_tree 区间暂时失效（end < start）。
-                # 此时退化为不过滤正文边界，避免表格被整批跳过。
+                # 保留该边界仅作为缺省回退；有 doc_tree 时优先按段落所属分区判定。
                 if end >= start:
                     body_range = (start, end)
 
+        def _table_section_type(pos: int) -> str | None:
+            if not has_doc_tree_scope or pos < 0:
+                return None
+            try:
+                return doc_tree.get_section_for_paragraph(pos)
+            except Exception:
+                return None
+
+        def _is_table_in_scope(pos: int) -> bool:
+            if target_indices is not None:
+                if pos < 0 or pos not in target_indices:
+                    return False
+            sec_type = _table_section_type(pos)
+            if sec_type is not None:
+                return sec_type == "body"
+            if body_range is not None:
+                return pos >= 0 and body_range[0] <= pos <= body_range[1]
+            return not has_doc_tree_scope
+
         # 构建表格（按文档顺序）→ 前置段落索引映射
-        body_el = doc.element.body
-        tbl_para_pos = []  # 与 doc.tables 顺序一致
-        para_idx = -1
-        for child in body_el:
-            tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
-            if tag == "p":
-                para_idx += 1
-            elif tag == "tbl":
-                # 兼容“文档开头就是表格”的情况：para_idx 可能仍为 -1
-                tbl_para_pos.append(para_idx if para_idx >= 0 else 0)
+        tbl_para_pos = top_level_table_anchor_positions(doc)
 
         # 智能总宽：先按 compact 目标估算每个常规表格宽度，再聚类到少量代表宽度。
         smart_width_plan: dict[int, int] = {}
@@ -1790,9 +2183,10 @@ class TableFormatRule(BaseRule):
             for tbl_idx, tbl in enumerate(doc.tables):
                 tbl_el = tbl._tbl
                 pos = tbl_para_pos[tbl_idx] if tbl_idx < len(tbl_para_pos) else -1
-                if body_range is not None and pos >= 0:
-                    if pos < body_range[0] or pos > body_range[1]:
-                        continue
+                if not _is_table_in_scope(pos):
+                    continue
+                if _table_has_drawing_or_object(tbl_el):
+                    continue
                 if _is_equation_table(tbl_el):
                     continue
 
@@ -1817,10 +2211,12 @@ class TableFormatRule(BaseRule):
             pos = tbl_para_pos[tbl_idx] if tbl_idx < len(tbl_para_pos) else -1
 
             # 跳过不在正文区域内的表格
-            if body_range is not None:
-                if pos >= 0 and (pos < body_range[0] or pos > body_range[1]):
-                    continue
-            # 公式表格由独立规则 equation_table_format 处理。
+            if not _is_table_in_scope(pos):
+                continue
+            if _table_has_drawing_or_object(tbl_el):
+                rich_content_table_skip_count += 1
+                continue
+            # 公式表格由公式规则集处理（formula_to_table / equation_table_format / formula_style）。
             if _is_equation_table(tbl_el):
                 continue
 
@@ -1989,6 +2385,16 @@ class TableFormatRule(BaseRule):
                 change_type="format",
                 before="尾括号换行位置不稳定",
                 after="已规范为“主名\\n(括号内容)”换行",
+                paragraph_index=-1,
+            )
+        if rich_content_table_skip_count:
+            tracker.record(
+                rule_name=self.name,
+                target=f"{rich_content_table_skip_count} 个含图片/对象表格",
+                section="body",
+                change_type="skip",
+                before="常规表格样式处理",
+                after="已跳过（避免破坏非标准布局表格）",
                 paragraph_index=-1,
             )
 

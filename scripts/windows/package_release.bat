@@ -11,7 +11,7 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-set "SPEC_FILE=Lark-Formatter_v0.1.0.spec"
+set "SPEC_FILE=Lark-Formatter_v0.20_LTS.spec"
 if not exist "%SPEC_FILE%" (
     echo [ERROR] Spec file not found: %SPEC_FILE%
     pause
@@ -49,7 +49,7 @@ if errorlevel 1 (
 )
 
 echo [3/3] Place templates folder next to EXE
-set "DIST_DIR=dist\Lark-Formatter_v0.1.0"
+set "DIST_DIR=dist\Lark-Formatter_v0.20_LTS"
 if not exist "%DIST_DIR%" (
     echo [ERROR] Dist folder not found: %DIST_DIR%
     pause
@@ -64,5 +64,5 @@ if errorlevel 1 (
 )
 
 echo [OK] Build completed.
-echo Output folder: dist\Lark-Formatter_v0.1.0
+echo Output folder: dist\Lark-Formatter_v0.20_LTS
 exit /b 0

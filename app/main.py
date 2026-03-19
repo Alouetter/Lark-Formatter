@@ -11,24 +11,28 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from src.utils.app_meta import APP_NAME, APP_USER_MODEL_ID, APP_VERSION
+
 
 def main() -> None:
     from PySide6.QtWidgets import QApplication, QMessageBox
     from PySide6.QtGui import QIcon
     from src.ui.main_window import MainWindow
     from src.ui.theme_manager import ThemeManager
+    from src.ui.wheel_guard import install_global_wheel_guard
 
     # Force Windows to treat this as a separate app from python.exe
     # This ensures the taskbar uses our custom icon instead of the Python logo
     try:
         import ctypes
-        myappid = 'alouette.lark-formatter.desktop.0.1'  # arbitrary string
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
     except Exception:
         pass
 
     app = QApplication(sys.argv)
-    app.setApplicationVersion("0.1.0")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    install_global_wheel_guard(app)
     
     icon_path = _ROOT / "src" / "ui" / "icons" / "app_icon.png"
     if icon_path.exists():

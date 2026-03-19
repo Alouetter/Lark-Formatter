@@ -8,13 +8,21 @@ from docx.oxml import OxmlElement
 from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from src.engine.rules.base import BaseRule
+from src.engine.rules import table_format as table_helpers
 from src.engine.change_tracker import ChangeTracker
 from src.scene.schema import SceneConfig, StyleConfig
-from src.utils.line_spacing import apply_line_spacing
+from src.utils.indent import apply_style_config_indents, style_config_indent_kwargs, sync_indent_ooxml
+from src.utils.line_spacing import apply_line_spacing, sync_spacing_ooxml
+from src.utils.ooxml import apply_explicit_rfonts
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
-_M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+ALIGNMENT_MAP = {
+    "left": WD_ALIGN_PARAGRAPH.LEFT,
+    "center": WD_ALIGN_PARAGRAPH.CENTER,
+    "right": WD_ALIGN_PARAGRAPH.RIGHT,
+    "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
+}
 
 
 def _w(tag: str) -> str:
@@ -71,115 +79,9 @@ class _TableInfo:
 
 # ── 工具函数 ──
 
-_RE_EQ_NUM = re.compile(
-    r'^\s*(?:[\.．…·•]{2,}\s*)?[\(（]\s*\d+(?:[\-\.]\d+)+\s*[\)）]\s*$'
-)
-_RE_EQ_NUM_SUFFIX = re.compile(
-    r'^(?P<prefix>.*?)(?:[\.．…·•]{2,}\s*)?[\(（]\s*\d+(?:[\-\.]\d+)+\s*[\)）]\s*$'
-)
-_RE_EQ_ARROW = re.compile(r'(→|←|↔|⇌|->|<-|<->)')
-_MAX_EQ_TABLE_ROWS = 20
-
-
-def _get_cell_text(tc) -> str:
-    """提取单元格纯文本"""
-    parts = []
-    for p in tc.findall(_w("p")):
-        for r in p.findall(_w("r")):
-            t = r.find(_w("t"))
-            if t is not None and t.text:
-                parts.append(t.text)
-    return "".join(parts)
-
-
-def _looks_like_formula_prefix(prefix: str) -> bool:
-    """判断编号前缀是否像公式表达式（覆盖“表达式+(2.8)”同格场景）。"""
-    if not prefix:
-        return False
-    if re.search(r'[=→←↔±×÷∑∫≤≥<>]', prefix):
-        return True
-    # 仅有一个连字符常见于普通文本（如 A-1），至少两个基础运算符再认定为公式
-    op_count = len(re.findall(r'[+\-*/]', prefix))
-    return op_count >= 2
-
-
-def _looks_like_equation_text(text: str) -> bool:
-    """判断文本是否像公式/反应式表达。"""
-    s = (text or "").strip()
-    if not s:
-        return False
-    if _RE_EQ_ARROW.search(s):
-        return True
-    if re.search(r'[A-Za-z0-9\)\]]\s*=\s*[A-Za-z0-9\(\[]', s):
-        return True
-    # 化学式/反应式常见：含字母且含多个运算符（兼容 Unicode 负号）
-    op_count = len(re.findall(r'[+\-−*/]', s))
-    alpha_count = len(re.findall(r'[A-Za-zΑ-Ωα-ω]', s))
-    if op_count >= 2 and alpha_count >= 2:
-        return True
-    return False
-
-
 def _is_equation_table(tbl_el) -> bool:
-    """检测是否为公式表格。
-
-    判据（满足任一即可）：
-    1. 含 oMath/oMathPara 或 MathType OLE 对象
-    2. 小表格（行数受限）且右侧单元格命中公式编号：
-       - 纯编号：(x-y)/(x.y)/……(x.y)
-       - 末尾编号：表达式\t(x.y) / 表达式……(x.y)
-    3. 无编号时，若多行内容高度像反应式/公式，也视为公式表格
-    """
-    if tbl_el.findall(f".//{{{_M_NS}}}oMathPara"):
-        return True
-    if tbl_el.findall(f".//{{{_M_NS}}}oMath"):
-        return True
-    if tbl_el.findall(f".//{{{_W_NS}}}r/{{{_W_NS}}}object"):
-        return True
-
-    rows = tbl_el.findall(_w("tr"))
-    if not rows or len(rows) > _MAX_EQ_TABLE_ROWS:
-        return False
-
-    formula_like_rows = 0
-    non_empty_rows = 0
-    max_cols = 0
-    for tr in rows:
-        cells = tr.findall(_w("tc"))
-        if not cells:
-            continue
-        max_cols = max(max_cols, len(cells))
-
-        cell_texts = [(_get_cell_text(tc) or "").strip() for tc in cells]
-        non_empty = [txt for txt in cell_texts if txt]
-        if non_empty:
-            non_empty_rows += 1
-
-        # 从右向左优先匹配“纯编号”单元格，兼容末列空白的情况
-        for txt in reversed(cell_texts):
-            if txt and _RE_EQ_NUM.match(txt):
-                return True
-
-        # 兼容“表达式 + 编号”同单元格写法（Word 可能丢失 \t 为 <w:tab/>）
-        right_non_empty = next((txt for txt in reversed(cell_texts) if txt), "")
-        if right_non_empty:
-            m = _RE_EQ_NUM_SUFFIX.match(right_non_empty)
-            if m and _looks_like_formula_prefix(m.group("prefix")):
-                return True
-
-        # 无编号行：按反应式/公式特征计数
-        if non_empty:
-            merged = " ".join(
-                txt for txt in non_empty if not _RE_EQ_NUM.match(txt)
-            )
-            if _looks_like_equation_text(merged):
-                formula_like_rows += 1
-
-    # 无明确编号时的兜底识别：
-    # 小列数表格（通常 2~3 列）且大多数非空行是公式/反应式
-    if non_empty_rows and max_cols <= 4 and formula_like_rows >= max(1, non_empty_rows - 1):
-        return True
-    return False
+    """Use the shared equation-table detector from table_format."""
+    return table_helpers._is_equation_table(tbl_el)
 
 
 def _para_has_image(para) -> bool:
@@ -608,29 +510,65 @@ def _rebuild_para_text_full(el, prefix, chapter_num, seq_num, sep, title, rpr_sr
     number_text = _compose_caption_number_text(chapter_num, seq_num, numbering_format)
     _make_run(el, text=f"{prefix}{number_text}{sep}{title}", rpr_src=rpr_src)
 
+def _set_run_toggle(rpr, tag: str, enabled: bool) -> None:
+    el = rpr.find(_w(tag))
+    if el is None:
+        el = etree.SubElement(rpr, _w(tag))
+    if enabled:
+        el.attrib.pop(_w("val"), None)
+    else:
+        el.set(_w("val"), "0")
+
+
+def _sync_caption_indent_ooxml(para, sc) -> None:
+    sync_indent_ooxml(
+        para._element,
+        **style_config_indent_kwargs(sc),
+    )
+
+
 def _format_caption_para(para, sc):
-    """对题注段落应用格式（居中、字体、间距）"""
+    """对题注段落应用格式。"""
     pf = para.paragraph_format
-    pf.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    pf.first_line_indent = None
-    pf.left_indent = None
+    align_key = str(getattr(sc, "alignment", "") or "").strip().lower()
+    pf.alignment = ALIGNMENT_MAP.get(align_key, WD_ALIGN_PARAGRAPH.CENTER)
     pf.space_before = Pt(sc.space_before_pt)
     pf.space_after = Pt(sc.space_after_pt)
     apply_line_spacing(pf, sc.line_spacing_type, sc.line_spacing_pt)
+    sync_spacing_ooxml(
+        para._element,
+        space_before_pt=sc.space_before_pt,
+        space_after_pt=sc.space_after_pt,
+        line_spacing_type=sc.line_spacing_type,
+        line_spacing_value=sc.line_spacing_pt,
+    )
+    apply_style_config_indents(pf, para._element, sc)
+    _sync_caption_indent_ooxml(para, sc)
     for run in para.runs:
         run.font.name = sc.font_en
         run.font.size = Pt(sc.size_pt)
+        run.font.bold = bool(sc.bold)
+        run.font.italic = bool(sc.italic)
         rpr = run._element.find(_w("rPr"))
         if rpr is None:
             rpr = etree.SubElement(run._element, _w("rPr"))
         rfonts = rpr.find(_w("rFonts"))
         if rfonts is None:
             rfonts = etree.SubElement(rpr, _w("rFonts"))
+        apply_explicit_rfonts(
+            rpr,
+            font_cn=sc.font_cn,
+            font_en=sc.font_en,
+        )
         rfonts.set(_w("eastAsia"), sc.font_cn)
         rfonts.set(_w("ascii"), sc.font_en)
         rfonts.set(_w("hAnsi"), sc.font_en)
         for attr in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "cstheme"):
             rfonts.attrib.pop(_w(attr), None)
+        _set_run_toggle(rpr, "b", bool(sc.bold))
+        _set_run_toggle(rpr, "bCs", bool(sc.bold))
+        _set_run_toggle(rpr, "i", bool(sc.italic))
+        _set_run_toggle(rpr, "iCs", bool(sc.italic))
 
 
 def _insert_caption_para(doc, anchor_elem, position,

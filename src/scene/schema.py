@@ -2,6 +2,32 @@
 
 from dataclasses import dataclass, field
 
+from src.utils.indent import sync_style_config_indent_fields
+
+
+def heading_level_keys() -> list[str]:
+    return [f"heading{i}" for i in range(1, 9)]
+
+
+def heading_level_index(level_name: str) -> int:
+    text = str(level_name or "").strip().lower()
+    if text.startswith("heading"):
+        try:
+            value = int(text[7:])
+        except ValueError:
+            return 1
+        if 1 <= value <= 8:
+            return value
+    return 1
+
+
+def default_chain_id_for_level(level_name: str) -> str:
+    level_idx = heading_level_index(level_name)
+    if level_idx <= 1:
+        return "current_only"
+    parts = [f"l{i}" for i in range(1, level_idx)]
+    return "_dot_".join(parts + ["current"])
+
 
 @dataclass
 class MarginConfig:
@@ -21,9 +47,255 @@ class PageSetupConfig:
 
 
 @dataclass
+class NumberShellConfig:
+    label: str = "{}"
+    prefix: str = ""
+    suffix: str = ""
+
+
+@dataclass
+class NumberCoreStyleConfig:
+    label: str = ""
+    sample: str = ""
+
+
+@dataclass
+class NumberChainSegmentConfig:
+    type: str = "value"  # "value" | "literal"
+    source: str = "current"
+    text: str = ""
+
+
+@dataclass
+class NumberChainConfig:
+    label: str = ""
+    segments: list[NumberChainSegmentConfig] = field(default_factory=list)
+
+
+@dataclass
+class NumberPresetConfig:
+    label: str = ""
+    display_shell: str = "plain"
+    display_core_style: str = "arabic"
+    reference_core_style: str = ""
+    chain: str = "current_only"
+
+
+@dataclass
+class HeadingLevelBindingConfig:
+    enabled: bool = False
+    display_shell: str = "plain"
+    display_core_style: str = "arabic"
+    reference_core_style: str = "arabic"
+    chain: str = "current_only"
+    title_separator: str = "\u3000"
+    ooxml_separator_mode: str = "inline"  # "inline" | "suff" | "none"
+    ooxml_suff: str | None = "nothing"    # "tab" | "space" | "nothing" | None
+    ooxml_lvl_ind: dict[str, str] = field(default_factory=dict)
+    start_at: int = 1
+    restart_on: str | None = None
+    include_in_toc: bool = True
+
+
+REMOVED_NUMBER_CORE_STYLE_IDS = frozenset(
+    {
+        "arabic_fullwidth",
+        "arabic_pad3",
+        "roman_lower",
+        "alpha_upper",
+        "alpha_lower",
+    }
+)
+
+
+def _default_shell_catalog() -> dict[str, NumberShellConfig]:
+    return {
+        "plain": NumberShellConfig(label="{}", prefix="", suffix=""),
+        "dot_suffix": NumberShellConfig(label="{}.", prefix="", suffix="."),
+        "chapter_cn": NumberShellConfig(label="第{}章", prefix="第", suffix="章"),
+        "section_cn": NumberShellConfig(label="第{}节", prefix="第", suffix="节"),
+        "dunhao_cn": NumberShellConfig(label="{}、", prefix="", suffix="、"),
+        "paren_cn": NumberShellConfig(label="（{}）", prefix="（", suffix="）"),
+        "paren_en": NumberShellConfig(label="({})", prefix="(", suffix=")"),
+        "appendix_cn": NumberShellConfig(label="附录{}", prefix="附录", suffix=""),
+    }
+
+
+def _default_core_style_catalog() -> dict[str, NumberCoreStyleConfig]:
+    return {
+        "arabic": NumberCoreStyleConfig(label="1 2 3", sample="1"),
+        "arabic_pad2": NumberCoreStyleConfig(label="01 02 03", sample="01"),
+        "cn_lower": NumberCoreStyleConfig(label="一 二 三", sample="一"),
+        "cn_upper": NumberCoreStyleConfig(label="壹 贰 叁", sample="壹"),
+        "roman_upper": NumberCoreStyleConfig(label="I II III", sample="I"),
+        "circled": NumberCoreStyleConfig(label="① ② ③", sample="①"),
+        "circled_paren": NumberCoreStyleConfig(label="⑴ ⑵ ⑶", sample="⑴"),
+    }
+
+
+def _chain_segments_for_level(level_idx: int) -> list[NumberChainSegmentConfig]:
+    if level_idx <= 1:
+        return [NumberChainSegmentConfig(type="value", source="current")]
+    segments: list[NumberChainSegmentConfig] = []
+    for idx in range(1, level_idx):
+        if segments:
+            segments.append(NumberChainSegmentConfig(type="literal", text="."))
+        segments.append(NumberChainSegmentConfig(type="value", source=f"level{idx}"))
+    segments.append(NumberChainSegmentConfig(type="literal", text="."))
+    segments.append(NumberChainSegmentConfig(type="value", source="current"))
+    return segments
+
+
+def _default_chain_catalog() -> dict[str, NumberChainConfig]:
+    labels = {
+        1: "一级",
+        2: "二级",
+        3: "三级",
+        4: "四级",
+        5: "五级",
+        6: "六级",
+        7: "七级",
+    }
+    catalog = {
+        "current_only": NumberChainConfig(
+            label="仅当前",
+            segments=[NumberChainSegmentConfig(type="value", source="current")],
+        )
+    }
+    for level_idx in range(2, 9):
+        chain_id = default_chain_id_for_level(f"heading{level_idx}")
+        names = [labels[idx] for idx in range(1, level_idx)]
+        catalog[chain_id] = NumberChainConfig(
+            label=".".join(names + ["当前"]),
+            segments=_chain_segments_for_level(level_idx),
+        )
+    return catalog
+
+
+def _default_preset_catalog() -> dict[str, NumberPresetConfig]:
+    return {
+        "chapter_cn": NumberPresetConfig(
+            label="第一章",
+            display_shell="chapter_cn",
+            display_core_style="cn_lower",
+            reference_core_style="arabic",
+            chain="current_only",
+        ),
+        "section_cn_arabic": NumberPresetConfig(
+            label="第1节",
+            display_shell="section_cn",
+            display_core_style="arabic",
+            reference_core_style="arabic",
+            chain="current_only",
+        ),
+        "ordinal_cn": NumberPresetConfig(
+            label="一、",
+            display_shell="dunhao_cn",
+            display_core_style="cn_lower",
+            reference_core_style="cn_lower",
+            chain="current_only",
+        ),
+        "paren_cn": NumberPresetConfig(
+            label="（一）",
+            display_shell="paren_cn",
+            display_core_style="cn_lower",
+            reference_core_style="cn_lower",
+            chain="current_only",
+        ),
+        "decimal_2": NumberPresetConfig(
+            label="1.1",
+            display_shell="plain",
+            display_core_style="arabic",
+            reference_core_style="arabic",
+            chain=default_chain_id_for_level("heading2"),
+        ),
+        "decimal_3": NumberPresetConfig(
+            label="1.1.1",
+            display_shell="plain",
+            display_core_style="arabic",
+            reference_core_style="arabic",
+            chain=default_chain_id_for_level("heading3"),
+        ),
+    }
+
+
+def _default_level_bindings() -> dict[str, HeadingLevelBindingConfig]:
+    bindings: dict[str, HeadingLevelBindingConfig] = {}
+    for level_name in heading_level_keys():
+        level_idx = heading_level_index(level_name)
+        bindings[level_name] = HeadingLevelBindingConfig(
+            enabled=False,
+            display_shell="plain",
+            display_core_style="arabic",
+            reference_core_style="arabic",
+            chain=default_chain_id_for_level(level_name),
+            title_separator="\u3000",
+            start_at=1,
+            restart_on=None if level_idx <= 1 else f"heading{level_idx - 1}",
+            include_in_toc=level_idx <= 3,
+        )
+
+    bindings["heading1"] = HeadingLevelBindingConfig(
+        enabled=True,
+        display_shell="chapter_cn",
+        display_core_style="cn_lower",
+        reference_core_style="arabic",
+        chain="current_only",
+        title_separator="\u3000",
+        start_at=1,
+        restart_on=None,
+        include_in_toc=True,
+    )
+    bindings["heading2"] = HeadingLevelBindingConfig(
+        enabled=True,
+        display_shell="plain",
+        display_core_style="arabic",
+        reference_core_style="arabic",
+        chain=default_chain_id_for_level("heading2"),
+        title_separator="\u3000",
+        start_at=1,
+        restart_on="heading1",
+        include_in_toc=True,
+    )
+    bindings["heading3"] = HeadingLevelBindingConfig(
+        enabled=True,
+        display_shell="paren_cn",
+        display_core_style="cn_lower",
+        reference_core_style="cn_lower",
+        chain="current_only",
+        title_separator="\u3000",
+        start_at=1,
+        restart_on="heading2",
+        include_in_toc=True,
+    )
+    bindings["heading4"] = HeadingLevelBindingConfig(
+        enabled=True,
+        display_shell="plain",
+        display_core_style="arabic",
+        reference_core_style="arabic",
+        chain=default_chain_id_for_level("heading4"),
+        title_separator="\u3000",
+        start_at=1,
+        restart_on="heading3",
+        include_in_toc=False,
+    )
+    return bindings
+
+
+@dataclass
+class HeadingNumberingV2Config:
+    enabled: bool = True
+    shell_catalog: dict[str, NumberShellConfig] = field(default_factory=_default_shell_catalog)
+    core_style_catalog: dict[str, NumberCoreStyleConfig] = field(default_factory=_default_core_style_catalog)
+    chain_catalog: dict[str, NumberChainConfig] = field(default_factory=_default_chain_catalog)
+    preset_catalog: dict[str, NumberPresetConfig] = field(default_factory=_default_preset_catalog)
+    level_bindings: dict[str, HeadingLevelBindingConfig] = field(default_factory=_default_level_bindings)
+
+
+@dataclass
 class HeadingLevelConfig:
     format: str = "arabic_dotted"
-    template: str = "{n}"
+    template: str = "{current}"
     separator: str = "\u3000"
     custom_separator: str | None = None
     alignment: str = ""          # "" 使用样式默认, "left"/"center"/"right"/"justify"
@@ -151,21 +423,35 @@ class StyleConfig:
     font_cn: str = "宋体"
     font_en: str = "Times New Roman"
     size_pt: float = 12
+    size_display: str = ""
     bold: bool = False
     italic: bool = False
     alignment: str = "justify"
     first_line_indent_chars: float = 0
+    first_line_indent_unit: str = "chars"
     left_indent_chars: float = 0
+    left_indent_unit: str = "chars"
+    right_indent_chars: float = 0
+    right_indent_unit: str = "chars"
+    hanging_indent_chars: float = 0
+    hanging_indent_unit: str = "chars"
+    special_indent_mode: str = "none"
+    special_indent_value: float = 0
+    special_indent_unit: str = "chars"
     line_spacing_type: str = "exact"  # exact=固定磅值; multiple=多倍行距（1.0/1.5/2.0/0.8...）
     line_spacing_pt: float = 20  # exact 时单位 pt；multiple 时表示倍数
     space_before_pt: float = 0
     space_after_pt: float = 0
+
+    def __post_init__(self):
+        sync_style_config_indent_fields(self)
 
 
 @dataclass
 class FormatScopeConfig:
     """排版作用域配置"""
     mode: str = "auto"  # "auto" 自动识别 / "manual" 手动指定
+    page_ranges_text: str = ""  # 手动模式：修正页码范围（示例：27-40,44-56）
     body_start_index: int | None = None  # 手动模式：正文起始段落索引（直接指定，优先级最高）
     body_start_page: int | None = None   # 手动模式：正文起始页码（物理页，从1开始）
     body_start_keyword: str = ""  # 保留兼容：正文起始关键字（最低优先级）
@@ -184,7 +470,15 @@ class FormatScopeConfig:
 
     def is_section_enabled(self, section_type: str) -> bool:
         """检查某分区是否启用排版"""
+        if str(section_type or "").strip().lower() == "cover":
+            return False
         return self.sections.get(section_type, False)
+
+
+@dataclass
+class TocConfig:
+    # word_native: Word 原生 TOC 域；plain: 普通目录条目（兼容旧实现）
+    mode: str = "word_native"
 
 
 @dataclass
@@ -203,13 +497,15 @@ class CaptionConfig:
 @dataclass
 class ChemTypographyConfig:
     """化学式上下角标恢复（实验室功能）"""
-    enabled: bool = True
+    enabled: bool = False
     scopes: dict[str, bool] = field(default_factory=lambda: {
-        "references": True,
+        "references": False,
         "body": False,
         "headings": False,
         "abstract_cn": False,
         "abstract_en": False,
+        "captions": False,
+        "tables": False,
     })
     # Force-allow list (higher priority than ignore/heuristics).
     allow_tokens: list[str] = field(default_factory=list)
@@ -222,9 +518,29 @@ class ChemTypographyConfig:
 
 
 @dataclass
+class MdCleanupConfig:
+    """Markdown 文本修复细项开关。"""
+    enabled: bool = False
+    # Preserve pre-existing Word list marker paragraphs when removing blank lines.
+    preserve_existing_word_lists: bool = True
+    # Collapse duplicated formula strings caused by Markdown->Word paste noise.
+    formula_copy_noise_cleanup: bool = True
+    # Remove fake ordered-list marker lines (e.g. "1.", "2.") around formula lines.
+    suppress_formula_fake_lists: bool = True
+    # List marker separator: "tab" | "half_space" | "full_space".
+    list_marker_separator: str = "tab"
+    # Ordered list style preset.
+    # "mixed" | "decimal_dot" | "decimal_paren_right" | "decimal_cn_dun" | "decimal_full_paren"
+    ordered_list_style: str = "mixed"
+    # Unordered list style preset.
+    # "word_default" | "bullet_dot" | "bullet_circle" | "bullet_square" | "bullet_dash"
+    unordered_list_style: str = "word_default"
+
+
+@dataclass
 class WhitespaceNormalizeConfig:
-    """空白字符统一（实验室功能，子项可选）"""
-    enabled: bool = True
+    """空白与全半角规范（实验室功能，子项可选）"""
+    enabled: bool = False
     normalize_space_variants: bool = True
     convert_tabs: bool = True
     remove_zero_width: bool = True
@@ -252,6 +568,63 @@ class CitationLinkConfig:
 
 
 @dataclass
+class FormulaConvertConfig:
+    """Formula recognition and conversion configuration."""
+    enabled: bool = False
+    # "word_native" | "latex"
+    output_mode: str = "word_native"
+    # User requirement: low-confidence formulas are skipped and marked by default.
+    low_confidence_policy: str = "skip_and_mark"
+    # Optional post-save fallback: use local Word/MathType OLE subsystem to
+    # extract MathML for unresolved MathType objects, then rewrite as OMML.
+    office_fallback_enabled: bool = False
+    office_fallback_timeout_sec: int = 30
+
+
+@dataclass
+class FormulaToTableConfig:
+    """Formula-to-table conversion configuration."""
+    enabled: bool = False
+    # MVP stage only processes display/block equations.
+    block_only: bool = True
+
+
+@dataclass
+class FormulaStyleConfig:
+    """Formula style normalization configuration."""
+    enabled: bool = False
+    unify_font: bool = True
+    unify_size: bool = True
+    unify_spacing: bool = True
+
+
+@dataclass
+class EquationTableFormatConfig:
+    """Equation-table numbering configuration."""
+    enabled: bool = False
+    numbering_format: str = "chapter.seq"
+
+
+@dataclass
+class FormulaTableConfig:
+    """Formula-table visual configuration shared by formula rules."""
+    formula_font_name: str = "Cambria Math"
+    formula_font_size_pt: float = 12.0
+    formula_font_size_display: str = ""
+    formula_line_spacing: float = 1.0
+    formula_space_before_pt: float = 0.0
+    formula_space_after_pt: float = 0.0
+    block_alignment: str = "center"
+    table_alignment: str = "center"
+    formula_cell_alignment: str = "center"
+    number_alignment: str = "right"
+    number_font_name: str = "Times New Roman"
+    number_font_size_pt: float = 10.5
+    number_font_size_display: str = ""
+    auto_shrink_number_column: bool = True
+
+
+@dataclass
 class OutputConfig:
     final_docx: bool = True
     compare_docx: bool = True
@@ -275,6 +648,7 @@ class SceneConfig:
     version: str = "1.0"
     name: str = ""
     description: str = ""
+    format_signature: str = ""
     category: str = "general"
     category_label: str = "通用文档"
     capabilities: dict[str, bool] = field(default_factory=lambda: {
@@ -295,11 +669,19 @@ class SceneConfig:
     ])
     page_setup: PageSetupConfig = field(default_factory=PageSetupConfig)
     heading_numbering: HeadingNumberingConfig = field(default_factory=HeadingNumberingConfig)
+    heading_numbering_v2: HeadingNumberingV2Config = field(default_factory=HeadingNumberingV2Config)
     heading_model: HeadingModelConfig = field(default_factory=HeadingModelConfig)
+    toc: TocConfig = field(default_factory=TocConfig)
     caption: CaptionConfig = field(default_factory=CaptionConfig)
     chem_typography: ChemTypographyConfig = field(default_factory=ChemTypographyConfig)
+    md_cleanup: MdCleanupConfig = field(default_factory=MdCleanupConfig)
     whitespace_normalize: WhitespaceNormalizeConfig = field(default_factory=WhitespaceNormalizeConfig)
     citation_link: CitationLinkConfig = field(default_factory=CitationLinkConfig)
+    formula_convert: FormulaConvertConfig = field(default_factory=FormulaConvertConfig)
+    formula_to_table: FormulaToTableConfig = field(default_factory=FormulaToTableConfig)
+    equation_table_format: EquationTableFormatConfig = field(default_factory=EquationTableFormatConfig)
+    formula_style: FormulaStyleConfig = field(default_factory=FormulaStyleConfig)
+    formula_table: FormulaTableConfig = field(default_factory=FormulaTableConfig)
     format_scope: FormatScopeConfig = field(default_factory=FormatScopeConfig)
     # 常规表格排版风格：compact=适宜压缩（默认），full=铺满页面
     normal_table_layout_mode: str = "smart"

@@ -6,17 +6,9 @@ from src.engine.rules.base import BaseRule
 from src.engine.change_tracker import ChangeTracker
 from src.scene.schema import SceneConfig
 from src.scene.heading_model import get_level_to_style_key, get_level_to_word_style
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 from src.utils.ooxml import (
     register_numbering, link_style_to_numbering, LEVEL_NAME_TO_ILVL,
 )
-
-ALIGNMENT_MAP = {
-    "left": WD_ALIGN_PARAGRAPH.LEFT,
-    "center": WD_ALIGN_PARAGRAPH.CENTER,
-    "right": WD_ALIGN_PARAGRAPH.RIGHT,
-    "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
-}
 
 # 编号前缀拆分：中文编号与阿拉伯编号分开处理，避免误拆 “2024年工作总结” 这类正文。
 _CN_NUMBERING_SPLIT_RE = re.compile(
@@ -93,6 +85,7 @@ class HeadingNumberingRule(BaseRule):
             doc,
             levels_config,
             config.styles,
+            level_bindings=config.heading_numbering_v2.level_bindings,
             level_to_style_key=level_style_key_map,
         )
 
@@ -104,8 +97,6 @@ class HeadingNumberingRule(BaseRule):
             if not style_name:
                 continue
             link_style_to_numbering(doc, style_name, num_id, ilvl)
-        # 按方案覆盖样式对齐（否则样式默认对齐会覆盖编号层定义）
-        self._sync_heading_style_alignment(doc, levels_config, level_style_map)
 
         # 3. 逐段落：剥离旧编号文本，应用 Heading 样式
         for h in headings:
@@ -128,6 +119,7 @@ class HeadingNumberingRule(BaseRule):
                     para.style = doc.styles[style_name]
                 except KeyError:
                     pass
+                self._clear_para_layout_overrides(para)
                 # 清除段落级 numPr 覆盖，让样式的 numPr 生效
                 self._clear_para_numpr(para)
                 # 清除 run 级别字体覆盖，让样式字体生效
@@ -147,8 +139,6 @@ class HeadingNumberingRule(BaseRule):
                       enforcement, tracker, config):
         """模式A：保留原编号文本，仅应用 Heading 样式"""
         level_style_map = get_level_to_word_style(config)
-        # 模式A也应尊重编号级别中的 alignment 配置（例如 right）。
-        self._sync_heading_style_alignment(doc, levels_config, level_style_map)
         for h in headings:
             para = doc.paragraphs[h.para_index]
             old_text = para.text
@@ -160,6 +150,7 @@ class HeadingNumberingRule(BaseRule):
                     para.style = doc.styles[style_name]
                 except KeyError:
                     pass
+                self._clear_para_layout_overrides(para)
                 self._clear_run_fonts(para)
 
             tracker.record(
@@ -171,21 +162,6 @@ class HeadingNumberingRule(BaseRule):
                 after=f"样式→{style_name}",
                 paragraph_index=h.para_index,
             )
-
-    @staticmethod
-    def _sync_heading_style_alignment(doc, levels_config, level_style_map: dict[str, str]) -> None:
-        for level_name, style_name in level_style_map.items():
-            lc = levels_config.get(level_name)
-            if lc is None:
-                continue
-            align_key = str(getattr(lc, "alignment", "") or "").strip().lower()
-            if align_key not in ALIGNMENT_MAP:
-                continue
-            try:
-                style = doc.styles[style_name]
-            except KeyError:
-                continue
-            style.paragraph_format.alignment = ALIGNMENT_MAP[align_key]
 
     @staticmethod
     def _clear_para_numpr(para) -> None:
@@ -200,6 +176,27 @@ class HeadingNumberingRule(BaseRule):
             numpr = ppr.find(f"{{{W}}}numPr")
             if numpr is not None:
                 ppr.remove(numpr)
+
+    @staticmethod
+    def _clear_para_layout_overrides(para) -> None:
+        """Clear direct paragraph layout overrides so style values can take effect.
+
+        Source headings often carry direct indentation / spacing / alignment copied
+        from正文段落，这些直改优先级高于样式，会导致克隆出的标题样式无法落地。
+        """
+        W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        ppr = para._element.find(f"{{{W}}}pPr")
+        if ppr is None:
+            return
+        for tag in ("ind", "spacing", "jc"):
+            child = ppr.find(f"{{{W}}}{tag}")
+            if child is not None:
+                ppr.remove(child)
+
+    @staticmethod
+    def _clear_para_indentation(para) -> None:
+        """Backward-compatible wrapper for older call sites/tests."""
+        HeadingNumberingRule._clear_para_layout_overrides(para)
 
     @staticmethod
     def _clear_run_fonts(para) -> None:
@@ -222,7 +219,7 @@ class HeadingNumberingRule(BaseRule):
             if rpr is None:
                 continue
             has_vert = rpr.find(f"{{{W}}}vertAlign") is not None
-            for tag in ("rFonts", "color"):
+            for tag in ("rFonts", "color", "b", "bCs", "i", "iCs"):
                 el = rpr.find(f"{{{W}}}{tag}")
                 if el is not None:
                     rpr.remove(el)

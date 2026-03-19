@@ -163,19 +163,115 @@ QComboBox QAbstractItemView {
     background-color: #252526;
     border: 1px solid #454545;
     border-radius: 4px;
-    padding: 4px;
-    selection-background-color: #37373d;
+    padding: 0;
+    selection-background-color: #32353a;
     selection-color: #ffffff;
     outline: none;
 }
 
 QComboBox QAbstractItemView::item {
-    padding: 6px 12px;
-    min-height: 24px;
+    padding: 4px 10px;
+    min-height: 18px;
+    margin: 0;
+    border: none;
+    background-color: transparent;
+    color: #d0d4d9;
 }
 
+QComboBox QAbstractItemView::item:selected,
 QComboBox QAbstractItemView::item:hover {
-    background-color: #2a2d2e;
+    background-color: #32353a;
+    color: #ffffff;
+}
+
+/* Compact style-config table */
+QTableWidget#StyleConfigTable {
+    background-color: #252526;
+    border: 1px solid #333333;
+    gridline-color: #32353a;
+    outline: none;
+}
+
+QTableWidget#StyleConfigTable::item {
+    padding: 0 4px;
+}
+
+QTableWidget#StyleConfigTable QHeaderView::section {
+    background-color: #2b2d30;
+    border: 1px solid #333333;
+    padding: 1px 3px;
+    min-height: 22px;
+    color: #d0d4d9;
+}
+
+QTableWidget#StyleConfigTable QHeaderView::section:vertical {
+    padding: 0 5px;
+}
+
+QTableWidget#StyleConfigTable QLineEdit,
+QTableWidget#StyleConfigTable QComboBox,
+QTableWidget#StyleConfigTable QSpinBox,
+QTableWidget#StyleConfigTable QDoubleSpinBox {
+    padding: 1px 4px;
+    min-height: 16px;
+}
+
+QTableWidget#StyleConfigTable QPushButton {
+    padding: 1px 8px;
+    min-height: 16px;
+}
+
+QTableWidget#StyleConfigTable QComboBox::drop-down {
+    width: 14px;
+    border-left: 1px solid #454545;
+}
+
+QTableWidget#StyleConfigTable QComboBox::down-arrow {
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #858585;
+}
+
+QTableWidget#StyleConfigTable QSpinBox::up-button, QTableWidget#StyleConfigTable QDoubleSpinBox::up-button,
+QTableWidget#StyleConfigTable QSpinBox::down-button, QTableWidget#StyleConfigTable QDoubleSpinBox::down-button {
+    width: 14px;
+    border-left: 1px solid #454545;
+    background: transparent;
+}
+
+QTableWidget#StyleConfigTable QSpinBox::up-arrow, QTableWidget#StyleConfigTable QDoubleSpinBox::up-arrow {
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-bottom: 5px solid #858585;
+}
+
+QTableWidget#StyleConfigTable QSpinBox::down-arrow, QTableWidget#StyleConfigTable QDoubleSpinBox::down-arrow {
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #858585;
+}
+
+QTableWidget#StyleConfigTable QComboBox QAbstractItemView {
+    padding: 0;
+    selection-background-color: #32353a;
+    selection-color: #ffffff;
+}
+
+QTableWidget#StyleConfigTable QComboBox QAbstractItemView::item {
+    padding: 1px 6px;
+    min-height: 14px;
+    margin: 0;
+    border: none;
+    background-color: transparent;
+}
+
+QTableWidget#StyleConfigTable QComboBox QAbstractItemView::item:selected,
+QTableWidget#StyleConfigTable QComboBox QAbstractItemView::item:hover {
+    background-color: #32353a;
     color: #ffffff;
 }
 

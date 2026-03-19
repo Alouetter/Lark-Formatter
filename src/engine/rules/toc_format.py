@@ -1,6 +1,7 @@
 """目录内容重建与格式化规则：清除旧 TOC、根据标题重建条目、包装域代码、应用格式"""
 
 import re
+from copy import deepcopy
 from types import SimpleNamespace
 from lxml import etree
 from docx import Document
@@ -8,12 +9,28 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.style import WD_STYLE_TYPE
 from src.engine.rules.base import BaseRule
 from src.engine.change_tracker import ChangeTracker
-from src.scene.heading_model import detect_level_by_style_name, get_front_matter_title_norms
+from src.scene.heading_model import (
+    detect_level_by_style_name,
+    get_front_matter_title_norms,
+    get_level_to_word_style,
+)
 from src.scene.schema import SceneConfig, StyleConfig
 from src.engine.doc_tree import DocTree
-from src.utils.line_spacing import apply_line_spacing
+from src.utils.heading_numbering_template import (
+    default_heading_numbering_template,
+    render_heading_numbering,
+)
+from src.utils.heading_numbering_v2 import (
+    advance_heading_counters,
+    included_toc_levels,
+    merged_level_binding,
+)
+from src.utils.indent import apply_style_config_indents
+from src.utils.line_spacing import apply_line_spacing, sync_spacing_ooxml
+from src.utils.ooxml import apply_explicit_rfonts
 from src.utils.toc_entry import (
     looks_like_toc_entry_line,
     looks_like_date_placeholder_line,
@@ -25,31 +42,47 @@ from src.utils.toc_entry import (
 )
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_TOC_BOOKMARK_PREFIX = "_TocRef_"
+_TOC_MODE_WORD_NATIVE = "word_native"
+_TOC_MODE_PLAIN = "plain"
 
 
 def _w(tag: str) -> str:
     return f"{{{_W_NS}}}{tag}"
 
 
-# ── 中文数字转换 ──
+def _resolve_toc_mode(config: SceneConfig) -> str:
+    toc_cfg = getattr(config, "toc", None)
+    raw_mode = str(getattr(toc_cfg, "mode", _TOC_MODE_WORD_NATIVE) or "").strip().lower()
+    if raw_mode in {"plain", "legacy"}:
+        return _TOC_MODE_PLAIN
+    if raw_mode in {"word_native", "native", "auto", "field"}:
+        return _TOC_MODE_WORD_NATIVE
+    return _TOC_MODE_WORD_NATIVE
 
-_CN_DIGITS = "零一二三四五六七八九十"
+
+def _configured_toc_levels(config: SceneConfig) -> list[str]:
+    levels = included_toc_levels(config.heading_numbering_v2.level_bindings)
+    return levels or ["heading1", "heading2", "heading3"]
 
 
-def _int_to_chinese(n: int) -> str:
-    """整数转中文数字（1~99）"""
-    if n <= 0:
-        return "零"
-    if n <= 10:
-        return _CN_DIGITS[n]
-    if n < 20:
-        return f"十{_CN_DIGITS[n - 10]}" if n > 10 else "十"
-    tens = n // 10
-    ones = n % 10
-    result = f"{_CN_DIGITS[tens]}十"
-    if ones:
-        result += _CN_DIGITS[ones]
-    return result
+def _native_toc_field_instruction(config: SceneConfig) -> str:
+    """Build TOC field instruction using outline-level switch (\\o).
+
+    Previous implementation used \\t (style-name matching), which is
+    case-sensitive and breaks on WPS-created documents where built-in heading
+    styles are stored as lowercase ``heading 1`` instead of ``Heading 1``.
+
+    The \\o switch matches paragraphs by their ``outlineLvl`` property, which
+    is always a numeric value set on the style definition and is therefore
+    immune to locale / case / office-suite differences.
+    """
+    levels = _configured_toc_levels(config)
+    if not levels:
+        max_level = 3
+    else:
+        max_level = max(int(lv[7:]) for lv in levels)
+    return f' TOC \\o "1-{max_level}" \\h \\z \\u '
 
 
 # ── 编号文本生成 ──
@@ -63,10 +96,20 @@ LEVEL_TO_TOC_STYLE = {
 
 # 层级 → Word TOC 样式名
 LEVEL_TO_WORD_STYLE = {
-    "heading1": "TOC 1",
-    "heading2": "TOC 2",
-    "heading3": "TOC 3",
+    f"heading{level_idx}": f"TOC {level_idx}"
+    for level_idx in range(1, 9)
 }
+
+
+def _toc_style_key_for_level(level: str) -> str:
+    level_idx = int(str(level or "heading1")[7:]) if str(level or "").startswith("heading") else 1
+    if level_idx <= 1:
+        return "toc_chapter"
+    if level_idx == 2:
+        return "toc_level1"
+    return "toc_level2"
+
+_TOC_HEADING_STYLE_CANDIDATES = ["TOC Heading", "目录标题"]
 
 ALIGNMENT_MAP = {
     "left": WD_ALIGN_PARAGRAPH.LEFT,
@@ -258,7 +301,13 @@ def _fallback_collect_headings(doc: Document, config: SceneConfig, toc_section=N
     return found
 
 
-def _extract_heading_title_runs(doc: Document, heading, fallback_title: str) -> list[dict]:
+def _extract_heading_title_runs(
+    doc: Document,
+    heading,
+    fallback_title: str,
+    *,
+    prefix_len: int = 0,
+) -> list[dict]:
     """提取标题正文 run 片段，尽量保留下/上角标信息。"""
     para_index = getattr(heading, "para_index", -1)
     if para_index < 0 or para_index >= len(doc.paragraphs):
@@ -268,10 +317,13 @@ def _extract_heading_title_runs(doc: Document, heading, fallback_title: str) -> 
     if not para.runs:
         return [{"text": fallback_title, "vert_align": None}] if fallback_title else []
 
-    from src.engine.rules.heading_numbering import split_heading_text
-    full_text = para.text or ""
-    number_part, sep_part, _ = split_heading_text(full_text)
-    strip_len = len(number_part) + len(sep_part) if number_part else 0
+    strip_len = max(0, int(prefix_len or 0))
+    if strip_len <= 0:
+        from src.engine.rules.heading_numbering import split_heading_text
+
+        full_text = para.text or ""
+        number_part, sep_part, _ = split_heading_text(full_text)
+        strip_len = len(number_part) + len(sep_part) if number_part else 0
 
     segments = []
     remaining = strip_len
@@ -314,52 +366,77 @@ def _extract_heading_title_runs(doc: Document, heading, fallback_title: str) -> 
     return segments
 
 
-def _build_toc_entries(doc: Document, headings, scheme: str, levels_config: dict,
+def _configured_heading_prefix_len(text: str, numbering: str) -> int:
+    raw = str(text or "")
+    if not raw or not numbering:
+        return 0
+    trimmed = raw.lstrip(" \t\u3000")
+    if not trimmed.startswith(numbering):
+        return 0
+    leading_len = len(raw) - len(trimmed)
+    suffix = trimmed[len(numbering):]
+    ws_suffix = len(suffix) - len(suffix.lstrip(" \t\u3000"))
+    return leading_len + len(numbering) + ws_suffix
+
+
+def _toc_entry_separator(separator: str | None) -> str:
+    raw = str(separator or "")
+    if "\t" not in raw:
+        return raw
+    return raw.replace("\t", "   ")
+
+
+def _build_toc_entries(doc: Document, headings, levels_config: dict,
+                       level_bindings: dict | None = None,
                        separator: str = "\u3000") -> list[dict]:
-    """根据标题列表和编号方案，生成 TOC 条目列表。
+    """根据标题列表和编号配置，生成 TOC 条目列表。
 
     返回 [{"level": str, "numbering": str, "title": str, "sep": str}, ...]
     """
     entries = []
+    counters = {f"heading{idx}": 0 for idx in range(1, 9)}
     # 层级计数器
-    chapter_num = 0
-    level1_num = 0
-    level2_num = 0
-
     for h in headings:
-        title = _strip_heading_number(h.text)
         level = h.level
 
-        if level == "heading1":
-            chapter_num += 1
-            level1_num = 0
-            level2_num = 0
-            numbering = _format_numbering(scheme, "heading1",
-                                          chapter_num, 0, 0, levels_config)
-        elif level == "heading2":
-            level1_num += 1
-            level2_num = 0
-            numbering = _format_numbering(scheme, "heading2",
-                                          chapter_num, level1_num, 0,
-                                          levels_config)
-        elif level == "heading3":
-            level2_num += 1
-            numbering = _format_numbering(scheme, "heading3",
-                                          chapter_num, level1_num,
-                                          level2_num, levels_config)
-        else:
-            # level3 不在 TOC 中显示
+        if level not in LEVEL_TO_WORD_STYLE:
             continue
+
+        counters = advance_heading_counters(level, counters, level_bindings)
+        if not merged_level_binding(level, level_bindings).include_in_toc:
+            continue
+
+        numbering = _format_numbering(level, counters, levels_config)
 
         # 获取该层级的分隔符
         lc = levels_config.get(level)
-        sep = lc.effective_separator if lc else separator
+        sep = _toc_entry_separator(lc.effective_separator if lc else separator)
+        prefix_len = _configured_heading_prefix_len(h.text, numbering)
+        if prefix_len > 0:
+            title = (h.text or "")[prefix_len:].strip()
+        else:
+            title = _strip_heading_number(h.text)
+        current_para_text = ""
+        para_index = getattr(h, "para_index", -1)
+        if 0 <= para_index < len(doc.paragraphs):
+            current_para_text = doc.paragraphs[para_index].text or ""
+        run_prefix_len = _configured_heading_prefix_len(current_para_text, numbering)
+
+        title_runs = _extract_heading_title_runs(
+            doc,
+            h,
+            title,
+            prefix_len=run_prefix_len,
+        )
+        title_runs_text = "".join(str(part.get("text", "") or "") for part in title_runs).strip()
+        if title and title_runs_text and _norm_no_space(title_runs_text) != _norm_no_space(title):
+            title_runs = [{"text": title, "vert_align": None}]
 
         entries.append({
             "level": level,
             "numbering": numbering,
             "title": title,
-            "title_runs": _extract_heading_title_runs(doc, h, title),
+            "title_runs": title_runs,
             "sep": sep,
             "para_index": h.para_index,
         })
@@ -497,57 +574,12 @@ def _build_back_matter_toc_entries(doc: Document, doc_tree: DocTree) -> list[dic
     return entries
 
 
-def _format_numbering(scheme: str, level: str,
-                      ch: int, l1: int, l2: int,
+def _format_numbering(level: str,
+                      counters: dict[str, int],
                       levels_config: dict) -> str:
-    """根据方案和层级生成编号文本。
-
-    方案1（阿拉伯数字）: 1, 1.1, 1.1.1
-    方案2（中文编号）: 第一章, 第一节, 一、
-    """
     lc = levels_config.get(level)
-    if not lc:
-        # 无配置时用默认阿拉伯数字
-        if level == "heading1":
-            return str(ch)
-        elif level == "heading2":
-            return f"{ch}.{l1}"
-        else:
-            return f"{ch}.{l1}.{l2}"
-
-    template = lc.template
-    fmt = lc.format
-
-    if scheme == "2":
-        # 中文编号方案
-        if level == "heading1":
-            return template.replace("{cn}", _int_to_chinese(ch)).replace("{n}", str(ch))
-        elif level == "heading2":
-            cn = _int_to_chinese(l1)
-            result = template.replace("{cn}", cn).replace("{n}", str(l1))
-            if "{parent}" in template:
-                result = result.replace("{parent}", str(ch))
-            return result
-        else:
-            cn = _int_to_chinese(l2)
-            result = template.replace("{cn}", cn).replace("{n}", str(l2))
-            if "{parent}" in template:
-                result = result.replace("{parent}", f"{ch}.{l1}")
-            return result
-    else:
-        # 阿拉伯数字方案
-        if level == "heading1":
-            return template.replace("{n}", str(ch)).replace("{cn}", str(ch))
-        elif level == "heading2":
-            result = template.replace("{n}", str(l1)).replace("{cn}", str(l1))
-            if "{parent}" in template:
-                result = result.replace("{parent}", str(ch))
-            return result
-        else:
-            result = template.replace("{n}", str(l2)).replace("{cn}", str(l2))
-            if "{parent}" in template:
-                result = result.replace("{parent}", f"{ch}.{l1}")
-            return result
+    template = lc.template if lc else default_heading_numbering_template(level)
+    return render_heading_numbering(level, template, levels_config, counters)
 
 
 # ── OOXML 段落构建 ──
@@ -602,16 +634,18 @@ def _build_toc_title_para(title_text: str = "目录") -> etree._Element:
     ppr = etree.SubElement(p, _w("pPr"))
     jc = etree.SubElement(ppr, _w("jc"))
     jc.set(_w("val"), "center")
+    outline = etree.SubElement(ppr, _w("outlineLvl"))
+    outline.set(_w("val"), "9")
     _make_run(p, text=title_text)
     return p
 
 
-def _build_toc_field_begin_para() -> etree._Element:
+def _build_toc_field_begin_para(field_instruction: str) -> etree._Element:
     """构建 TOC 域代码起始段落（begin + instrText + separate）"""
     p = OxmlElement('w:p')
     # dirty=true 提示 Word 打开时刷新目录域
     _make_fld_char(p, "begin", dirty=True)
-    _make_instr_text(p, ' TOC \\o "1-3" \\h \\z \\u ')
+    _make_instr_text(p, field_instruction)
     _make_fld_char(p, "separate")
     return p
 
@@ -635,7 +669,37 @@ def _max_bookmark_id(doc: Document) -> int:
 
 
 def _bookmark_name_for_para(para_index: int) -> str:
-    return f"_TocRef_{para_index}"
+    return f"{_TOC_BOOKMARK_PREFIX}{para_index}"
+
+
+def _purge_generated_toc_bookmarks(doc: Document) -> int:
+    """Remove stale auto-generated TOC bookmarks to avoid wrong PAGEREF targets."""
+    to_remove_ids: set[str] = set()
+    removed = 0
+
+    for b_start in list(doc.element.body.iter(_w("bookmarkStart"))):
+        name = (b_start.get(_w("name")) or "").strip()
+        if not name.startswith(_TOC_BOOKMARK_PREFIX):
+            continue
+        bid = (b_start.get(_w("id")) or "").strip()
+        if bid:
+            to_remove_ids.add(bid)
+        parent = b_start.getparent()
+        if parent is not None:
+            parent.remove(b_start)
+            removed += 1
+
+    if to_remove_ids:
+        for b_end in list(doc.element.body.iter(_w("bookmarkEnd"))):
+            bid = (b_end.get(_w("id")) or "").strip()
+            if bid not in to_remove_ids:
+                continue
+            parent = b_end.getparent()
+            if parent is not None:
+                parent.remove(b_end)
+                removed += 1
+
+    return removed
 
 
 def _ensure_bookmark_for_para(doc: Document, para_index: int,
@@ -666,6 +730,7 @@ def _ensure_bookmark_for_para(doc: Document, para_index: int,
 
 def _attach_entry_bookmarks(doc: Document, entries: list[dict]) -> None:
     """给目录条目目标段落绑定书签，供 PAGEREF 取页码。"""
+    _purge_generated_toc_bookmarks(doc)
     next_id = _max_bookmark_id(doc) + 1
     # 先收集全局已存在书签，避免重复
     existing_names = set()
@@ -697,28 +762,41 @@ def _make_pageref_field(parent, bookmark_name: str):
     _make_fld_char(parent, "end")
 
 
+def _make_hyperlink_field(parent, bookmark_name: str, parts: list[dict]) -> None:
+    """Create an in-document hyperlink field for TOC labels."""
+    _make_fld_char(parent, "begin", dirty=True)
+    _make_instr_text(parent, f' HYPERLINK \\l "{bookmark_name}" ')
+    _make_fld_char(parent, "separate")
+    for part in parts:
+        txt = part.get("text", "")
+        if not txt:
+            continue
+        _make_run(parent, text=txt, vert_align=part.get("vert_align"))
+    _make_fld_char(parent, "end")
+
+
 def _build_toc_entry_para(entry: dict, tab_pos_twips: int,
                           word_style: str) -> etree._Element:
-    """构建单个 TOC 条目段落元素。
-
-    结构: [编号][分隔符][标题][tab][页码占位]
-    注意: pStyle 通过 python-docx API 在格式化阶段设置（因为 style_id 因文档而异）
-    """
+    """Build one TOC entry paragraph: hyperlink label + tab + page field."""
     p = OxmlElement('w:p')
 
-    # 段落属性：右对齐 tab stop（点线前导符）
+    # Paragraph properties: right-aligned dot leader tab stop.
     ppr = etree.SubElement(p, _w("pPr"))
+    style_id = re.sub(r"\s+", "", word_style or "")
+    if style_id:
+        p_style = etree.SubElement(ppr, _w("pStyle"))
+        p_style.set(_w("val"), style_id)
     tabs = etree.SubElement(ppr, _w("tabs"))
     tab = etree.SubElement(tabs, _w("tab"))
     tab.set(_w("val"), "right")
     tab.set(_w("leader"), "dot")
     tab.set(_w("pos"), str(tab_pos_twips))
 
-    # 条目文本：编号文本 + 标题run片段（保留下/上角标）
+    label_parts: list[dict] = []
     numbering = entry.get("numbering", "")
     sep = entry.get("sep", "")
     if numbering:
-        _make_run(p, text=f"{numbering}{sep}")
+        label_parts.append({"text": f"{numbering}{sep}", "vert_align": None})
 
     title_runs = entry.get("title_runs") or []
     if title_runs:
@@ -726,17 +804,31 @@ def _build_toc_entry_para(entry: dict, tab_pos_twips: int,
             txt = part.get("text", "")
             if not txt:
                 continue
-            _make_run(p, text=txt, vert_align=part.get("vert_align"))
+            label_parts.append({
+                "text": txt,
+                "vert_align": part.get("vert_align"),
+            })
     else:
-        _make_run(p, text=entry.get("title", ""))
+        title = entry.get("title", "")
+        if title:
+            label_parts.append({"text": title, "vert_align": None})
 
-    # tab + PAGEREF 页码域
-    _make_tab_run(p)
+    if not label_parts:
+        label_parts.append({"text": "", "vert_align": None})
+
     bname = entry.get("bookmark")
+    if bname:
+        _make_hyperlink_field(p, bname, label_parts)
+    else:
+        for part in label_parts:
+            _make_run(p, text=part.get("text", ""), vert_align=part.get("vert_align"))
+
+    # Append tab + PAGEREF page-number field.
+    _make_tab_run(p)
     if bname:
         _make_pageref_field(p, bname)
     else:
-        _make_run(p, text="1")  # 兜底占位
+        _make_run(p, text="1")  # Fallback placeholder.
 
     return p
 
@@ -746,6 +838,19 @@ def _format_toc_para(para, sc: StyleConfig, is_title: bool = False):
     pf = para.paragraph_format
 
     # 对齐：优先使用配置，缺省时标题居中/条目左对齐。
+    if is_title:
+        ppr = para._element.find(_w("pPr"))
+        if ppr is None:
+            ppr = etree.SubElement(para._element, _w("pPr"))
+            para._element.insert(0, ppr)
+        numpr = ppr.find(_w("numPr"))
+        if numpr is not None:
+            ppr.remove(numpr)
+        outline = ppr.find(_w("outlineLvl"))
+        if outline is None:
+            outline = etree.SubElement(ppr, _w("outlineLvl"))
+        outline.set(_w("val"), "9")
+
     align_key = str(getattr(sc, "alignment", "") or "").strip().lower()
     if align_key in ALIGNMENT_MAP:
         pf.alignment = ALIGNMENT_MAP[align_key]
@@ -758,31 +863,17 @@ def _format_toc_para(para, sc: StyleConfig, is_title: bool = False):
     pf.space_before = Pt(sc.space_before_pt)
     pf.space_after = Pt(sc.space_after_pt)
     apply_line_spacing(pf, sc.line_spacing_type, sc.line_spacing_pt)
+    sync_spacing_ooxml(
+        para._element,
+        space_before_pt=sc.space_before_pt,
+        space_after_pt=sc.space_after_pt,
+        line_spacing_type=sc.line_spacing_type,
+        line_spacing_value=sc.line_spacing_pt,
+    )
 
     # 缩进：按配置字符数应用（与正文样式一致的换算规则）。
-    first_chars = max(0.0, float(getattr(sc, "first_line_indent_chars", 0.0) or 0.0))
-    left_chars = max(0.0, float(getattr(sc, "left_indent_chars", 0.0) or 0.0))
-    first_pt = sc.size_pt * first_chars
-    left_pt = sc.size_pt * left_chars
-    pf.first_line_indent = Pt(first_pt if first_pt > 0 else 0)
-    pf.left_indent = Pt(left_pt if left_pt > 0 else 0)
-    pf.right_indent = Pt(0)
+    apply_style_config_indents(pf, para._element, sc)
 
-    # 同步到 OOXML，避免样式继承覆盖配置缩进。
-    ppr = para._element.find(_w("pPr"))
-    if ppr is None:
-        ppr = etree.SubElement(para._element, _w("pPr"))
-    ind = ppr.find(_w("ind"))
-    if ind is None:
-        ind = etree.SubElement(ppr, _w("ind"))
-    ind.set(_w("left"), str(int(round(left_pt * 20))))
-    ind.set(_w("right"), "0")
-    ind.set(_w("firstLine"), str(int(round(first_pt * 20))))
-    ind.attrib.pop(_w("hanging"), None)
-    for char_attr in ("leftChars", "rightChars", "firstLineChars", "hangingChars"):
-        ind.attrib.pop(_w(char_attr), None)
-
-    # 字体
     for run in para.runs:
         run.font.name = sc.font_en
         run.font.size = Pt(sc.size_pt)
@@ -794,6 +885,11 @@ def _format_toc_para(para, sc: StyleConfig, is_title: bool = False):
         rfonts = rpr.find(_w("rFonts"))
         if rfonts is None:
             rfonts = etree.SubElement(rpr, _w("rFonts"))
+        apply_explicit_rfonts(
+            rpr,
+            font_cn=sc.font_cn,
+            font_en=sc.font_en,
+        )
         rfonts.set(_w("eastAsia"), sc.font_cn)
         rfonts.set(_w("ascii"), sc.font_en)
         rfonts.set(_w("hAnsi"), sc.font_en)
@@ -803,13 +899,91 @@ def _format_toc_para(para, sc: StyleConfig, is_title: bool = False):
 
 def _toc_style_candidates(level: str) -> list[str]:
     """返回某 TOC 层级可能存在的样式名候选（中英/大小写）。"""
-    if level == "heading1":
-        return ["TOC 1", "toc 1", "目录 1"]
-    if level == "heading2":
-        return ["TOC 2", "toc 2", "目录 2"]
-    if level == "heading3":
-        return ["TOC 3", "toc 3", "目录 3"]
-    return ["TOC 1", "toc 1", "目录 1"]
+    level_idx = max(1, min(8, int(level[7:]) if str(level).startswith("heading") else 1))
+    return [f"TOC {level_idx}", f"toc {level_idx}", f"目录 {level_idx}"]
+
+
+def _find_toc_style_by_level(doc: Document, level: str):
+    """按层级查找已有 TOC 段落样式。"""
+    for style_name in _toc_style_candidates(level):
+        try:
+            style = doc.styles[style_name]
+        except KeyError:
+            continue
+        if style.type == WD_STYLE_TYPE.PARAGRAPH:
+            return style
+
+    for style in doc.styles:
+        if style.type != WD_STYLE_TYPE.PARAGRAPH:
+            continue
+        style_name = style.name or ""
+        style_id = getattr(style, "style_id", "") or ""
+        if (
+            _toc_level_from_style_name(style_name) == level
+            or _toc_level_from_style_name(style_id) == level
+        ):
+            return style
+    return None
+
+
+def _ensure_toc_style_for_level(doc: Document, level: str):
+    """确保 TOC 层级样式存在，必要时创建标准样式名。"""
+    style = _find_toc_style_by_level(doc, level)
+    if style is not None:
+        return style
+
+    style_name = LEVEL_TO_WORD_STYLE.get(level, "TOC 1")
+    try:
+        return doc.styles.add_style(style_name, WD_STYLE_TYPE.PARAGRAPH)
+    except ValueError:
+        # 样式名可能已存在于隐藏/延迟加载集合中，再次按名称取一次。
+        try:
+            style = doc.styles[style_name]
+        except KeyError:
+            return None
+        if style.type == WD_STYLE_TYPE.PARAGRAPH:
+            return style
+        return None
+
+
+def _is_toc_heading_style_name(style_name: str) -> bool:
+    norm = _norm_no_space(style_name).lower()
+    return norm in {"tocheading", "目录标题"}
+
+
+def _find_toc_heading_style(doc: Document):
+    for name in _TOC_HEADING_STYLE_CANDIDATES:
+        try:
+            style = doc.styles[name]
+        except KeyError:
+            continue
+        if style.type == WD_STYLE_TYPE.PARAGRAPH:
+            return style
+
+    for style in doc.styles:
+        if style.type != WD_STYLE_TYPE.PARAGRAPH:
+            continue
+        style_name = style.name or ""
+        style_id = getattr(style, "style_id", "") or ""
+        if _is_toc_heading_style_name(style_name) or _is_toc_heading_style_name(style_id):
+            return style
+    return None
+
+
+def _ensure_toc_heading_style(doc: Document):
+    style = _find_toc_heading_style(doc)
+    if style is not None:
+        return style
+    try:
+        return doc.styles.add_style("TOC Heading", WD_STYLE_TYPE.PARAGRAPH)
+    except ValueError:
+        try:
+            style = doc.styles["TOC Heading"]
+        except KeyError:
+            return None
+        if style.type == WD_STYLE_TYPE.PARAGRAPH:
+            return style
+        return None
 
 
 def _is_toc_level_style_name(style_name: str) -> bool:
@@ -827,12 +1001,8 @@ def _toc_level_from_style_name(style_name: str) -> str | None:
     if not m:
         return None
     n = int(m.group(1))
-    if n == 1:
-        return "heading1"
-    if n == 2:
-        return "heading2"
-    if n == 3:
-        return "heading3"
+    if 1 <= n <= 8:
+        return f"heading{n}"
     return None
 
 
@@ -855,36 +1025,22 @@ def _normalize_toc_style(style, sc: StyleConfig | None = None) -> None:
     else:
         pf.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
-    first_chars = max(0.0, float(getattr(sc, "first_line_indent_chars", 0.0) or 0.0))
-    left_chars = max(0.0, float(getattr(sc, "left_indent_chars", 0.0) or 0.0))
-    first_pt = sc.size_pt * first_chars
-    left_pt = sc.size_pt * left_chars
-
-    pf.left_indent = Pt(left_pt if left_pt > 0 else 0)
-    pf.first_line_indent = Pt(first_pt if first_pt > 0 else 0)
-    pf.right_indent = Pt(0)
+    apply_style_config_indents(pf, style.element, sc)
     pf.space_before = Pt(sc.space_before_pt)
     pf.space_after = Pt(sc.space_after_pt)
     apply_line_spacing(pf, sc.line_spacing_type, sc.line_spacing_pt)
+    sync_spacing_ooxml(
+        style.element,
+        space_before_pt=sc.space_before_pt,
+        space_after_pt=sc.space_after_pt,
+        line_spacing_type=sc.line_spacing_type,
+        line_spacing_value=sc.line_spacing_pt,
+    )
 
     style.font.name = sc.font_en
     style.font.size = Pt(sc.size_pt)
     style.font.bold = bool(sc.bold)
     style.font.italic = bool(sc.italic)
-
-    # OOXML 级兜底（清理 chars 缩进）
-    ppr = style.element.find(_w("pPr"))
-    if ppr is None:
-        ppr = etree.SubElement(style.element, _w("pPr"))
-    ind = ppr.find(_w("ind"))
-    if ind is None:
-        ind = etree.SubElement(ppr, _w("ind"))
-    ind.set(_w("left"), str(int(round(left_pt * 20))))
-    ind.set(_w("right"), "0")
-    ind.set(_w("firstLine"), str(int(round(first_pt * 20))))
-    ind.attrib.pop(_w("hanging"), None)
-    for char_attr in ("leftChars", "rightChars", "firstLineChars", "hangingChars"):
-        ind.attrib.pop(_w(char_attr), None)
 
     rpr = style.element.find(_w("rPr"))
     if rpr is None:
@@ -892,6 +1048,11 @@ def _normalize_toc_style(style, sc: StyleConfig | None = None) -> None:
     rfonts = rpr.find(_w("rFonts"))
     if rfonts is None:
         rfonts = etree.SubElement(rpr, _w("rFonts"))
+    apply_explicit_rfonts(
+        rpr,
+        font_cn=sc.font_cn,
+        font_en=sc.font_en,
+    )
     rfonts.set(_w("eastAsia"), sc.font_cn)
     rfonts.set(_w("ascii"), sc.font_en)
     rfonts.set(_w("hAnsi"), sc.font_en)
@@ -899,22 +1060,72 @@ def _normalize_toc_style(style, sc: StyleConfig | None = None) -> None:
         rfonts.attrib.pop(_w(attr), None)
 
 
+def _normalize_toc_heading_style(doc: Document, style, sc: StyleConfig | None = None) -> None:
+    """Prevent TOC title style from inheriting heading numbering / outline level."""
+    try:
+        style.base_style = doc.styles["Normal"]
+    except Exception:
+        pass
+
+    _normalize_toc_style(style, sc)
+
+    ppr = style.element.find(_w("pPr"))
+    if ppr is None:
+        ppr = etree.SubElement(style.element, _w("pPr"))
+    numpr = ppr.find(_w("numPr"))
+    if numpr is not None:
+        ppr.remove(numpr)
+    outline = ppr.find(_w("outlineLvl"))
+    if outline is None:
+        outline = etree.SubElement(ppr, _w("outlineLvl"))
+    outline.set(_w("val"), "9")
+
+
 def _normalize_toc_styles_in_doc(doc: Document, config: SceneConfig) -> int:
     """统一修正文档内 TOC 样式定义，返回修正样式数。"""
     count = 0
-    for st in doc.styles:
-        if st.type != 1:  # WD_STYLE_TYPE.PARAGRAPH
+    normalized_style_ids: set[str] = set()
+    toc_levels = _configured_toc_levels(config)
+    level_styles: dict[str, list] = {lv: [] for lv in toc_levels}
+
+    for style in doc.styles:
+        if style.type != WD_STYLE_TYPE.PARAGRAPH:
             continue
-        name = st.name or ""
-        style_id = getattr(st, "style_id", "") or ""
-        level = _toc_level_from_style_name(name) or _toc_level_from_style_name(style_id)
-        if level is None:
-            continue
-        style_key = LEVEL_TO_TOC_STYLE.get(level)
+        style_name = style.name or ""
+        style_id = getattr(style, "style_id", "") or ""
+        level = _toc_level_from_style_name(style_name) or _toc_level_from_style_name(style_id)
+        if level in level_styles:
+            level_styles[level].append(style)
+
+    for level in toc_levels:
+        style_key = _toc_style_key_for_level(level)
+        styles = level_styles.get(level) or []
+        if not styles:
+            ensured = _ensure_toc_style_for_level(doc, level)
+            if ensured is not None:
+                styles = [ensured]
+
         sc = config.styles.get(style_key) if style_key else None
-        if _is_toc_level_style_name(name) or _is_toc_level_style_name(style_id):
-            _normalize_toc_style(st, sc)
+        for style in styles:
+            style_id = getattr(style, "style_id", "") or style.name or f"id({id(style)})"
+            if style_id in normalized_style_ids:
+                continue
+            _normalize_toc_style(style, sc)
+            normalized_style_ids.add(style_id)
             count += 1
+
+    heading_style = _ensure_toc_heading_style(doc)
+    if heading_style is not None:
+        heading_style_id = (
+            getattr(heading_style, "style_id", "")
+            or heading_style.name
+            or f"id({id(heading_style)})"
+        )
+        if heading_style_id not in normalized_style_ids:
+            _normalize_toc_heading_style(doc, heading_style, config.styles.get("toc_title") or StyleConfig())
+            normalized_style_ids.add(heading_style_id)
+            count += 1
+
     return count
 
 
@@ -955,6 +1166,35 @@ def _has_page_break(elements: list) -> bool:
             if pbb is not None:
                 return True
     return False
+
+
+def _extract_last_toc_section_break(elements: list):
+    """Capture trailing sectPr inside old TOC block so rebuild won't drop section boundaries."""
+    for el in reversed(elements):
+        tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+        if tag != "p":
+            continue
+        ppr = el.find(_w("pPr"))
+        if ppr is None:
+            continue
+        sect = ppr.find(_w("sectPr"))
+        if sect is not None:
+            return deepcopy(sect)
+    return None
+
+
+def _apply_section_break_to_para(para_el, sect_pr) -> None:
+    """Attach preserved sectPr to a rebuilt TOC paragraph."""
+    if para_el is None or sect_pr is None:
+        return
+    ppr = para_el.find(_w("pPr"))
+    if ppr is None:
+        ppr = etree.SubElement(para_el, _w("pPr"))
+        para_el.insert(0, ppr)
+    old = ppr.find(_w("sectPr"))
+    if old is not None:
+        ppr.remove(old)
+    ppr.append(deepcopy(sect_pr))
 
 
 def _build_page_break_para() -> etree._Element:
@@ -1119,61 +1359,121 @@ class TocFormatRule(BaseRule):
             )
             return
 
-        # 确定编号方案
-        scheme = config.heading_numbering.scheme
-        levels_config = config.heading_numbering.levels
+        toc_mode = _resolve_toc_mode(config)
+        delta = 0
+        if toc_mode == _TOC_MODE_PLAIN:
+            # 确定编号方案
+            levels_config = config.heading_numbering.levels
 
-        # 生成 TOC 条目
-        entries = []
-        entries.extend(_build_front_matter_toc_entries(doc, doc_tree))
-        entries.extend(_build_back_matter_toc_entries(doc, doc_tree))
-        if headings:
-            headings = sorted(headings, key=lambda h: getattr(h, "para_index", 10**9))
-            entries.extend(_build_toc_entries(doc, headings, scheme, levels_config))
-        entries.sort(key=lambda e: e.get("para_index", 10**9))
-        entries = _dedupe_entries(entries)
-        if not entries:
-            self._keep_existing_toc_with_normalize(
+            # 生成普通目录条目
+            entries = []
+            entries.extend(_build_front_matter_toc_entries(doc, doc_tree))
+            entries.extend(_build_back_matter_toc_entries(doc, doc_tree))
+            if headings:
+                headings = sorted(headings, key=lambda h: getattr(h, "para_index", 10**9))
+                entries.extend(
+                    _build_toc_entries(
+                        doc,
+                        headings,
+                        levels_config,
+                        config.heading_numbering_v2.level_bindings,
+                    )
+                )
+            entries.sort(key=lambda e: e.get("para_index", 10**9))
+            entries = _dedupe_entries(entries)
+            if not entries:
+                self._keep_existing_toc_with_normalize(
+                    doc,
+                    config,
+                    tracker,
+                    toc_section=toc_section,
+                    paragraph_index=toc_section.start_index if toc_section else -1,
+                )
+                return
+            if self._rebuild_coverage_too_low(existing_toc_entries, len(entries)):
+                tracker.record(
+                    rule_name=self.name,
+                    target="TOC rebuild guard",
+                    section="toc",
+                    change_type="skip",
+                    before=f"existing_entries={existing_toc_entries}",
+                    after=f"rebuilt_entries={len(entries)} (coverage too low)",
+                    paragraph_index=toc_section.start_index,
+                )
+                self._keep_existing_toc_with_normalize(
+                    doc,
+                    config,
+                    tracker,
+                    toc_section=toc_section,
+                    paragraph_index=toc_section.start_index,
+                )
+                return
+
+            # 为条目目标段落绑定书签，供 PAGEREF 自动取页码
+            _attach_entry_bookmarks(doc, entries)
+
+            # 计算右对齐 tab stop 位置（页面宽度 - 左右边距）
+            ps = config.page_setup
+            page_w_twips = 11906  # A4 宽度
+            left_twips = _cm_to_twips(ps.margin.left_cm)
+            right_twips = _cm_to_twips(ps.margin.right_cm)
+            gutter_twips = _cm_to_twips(ps.gutter_cm)
+            tab_pos = page_w_twips - left_twips - right_twips - gutter_twips
+
+            # 清除旧 TOC 段落，插入新内容，返回段落数变化量
+            delta = self._rebuild_toc(
                 doc,
+                doc_tree,
+                toc_section,
+                entries,
+                tab_pos,
                 config,
                 tracker,
-                toc_section=toc_section,
-                paragraph_index=toc_section.start_index if toc_section else -1,
             )
-            return
-        if self._rebuild_coverage_too_low(existing_toc_entries, len(entries)):
-            tracker.record(
-                rule_name=self.name,
-                target="TOC rebuild guard",
-                section="toc",
-                change_type="skip",
-                before=f"existing_entries={existing_toc_entries}",
-                after=f"rebuilt_entries={len(entries)} (coverage too low)",
-                paragraph_index=toc_section.start_index,
-            )
-            self._keep_existing_toc_with_normalize(
+        else:
+            if not headings:
+                tracker.record(
+                    rule_name=self.name,
+                    target="TOC rebuild guard",
+                    section="toc",
+                    change_type="skip",
+                    before=f"existing_entries={existing_toc_entries}",
+                    after="native mode needs heading evidence, keep existing TOC",
+                    paragraph_index=toc_section.start_index,
+                )
+                self._keep_existing_toc_with_normalize(
+                    doc,
+                    config,
+                    tracker,
+                    toc_section=toc_section,
+                    paragraph_index=toc_section.start_index,
+                )
+                return
+            _purge_generated_toc_bookmarks(doc)
+            levels_config = config.heading_numbering.levels
+            native_seed_entries = _build_toc_entries(
                 doc,
+                sorted(headings, key=lambda h: getattr(h, "para_index", 10**9)),
+                levels_config,
+                config.heading_numbering_v2.level_bindings,
+            )
+            native_seed_entries = _dedupe_entries(native_seed_entries)
+
+            ps = config.page_setup
+            page_w_twips = 11906  # A4 宽度
+            left_twips = _cm_to_twips(ps.margin.left_cm)
+            right_twips = _cm_to_twips(ps.margin.right_cm)
+            gutter_twips = _cm_to_twips(ps.gutter_cm)
+            tab_pos = page_w_twips - left_twips - right_twips - gutter_twips
+
+            delta = self._rebuild_native_toc(
+                doc,
+                toc_section,
                 config,
                 tracker,
-                toc_section=toc_section,
-                paragraph_index=toc_section.start_index,
+                seed_entries=native_seed_entries,
+                tab_pos_twips=tab_pos,
             )
-            return
-
-        # 为条目目标段落绑定书签，供 PAGEREF 自动取页码
-        _attach_entry_bookmarks(doc, entries)
-
-        # 计算右对齐 tab stop 位置（页面宽度 - 左右边距）
-        ps = config.page_setup
-        page_w_twips = 11906  # A4 宽度
-        left_twips = _cm_to_twips(ps.margin.left_cm)
-        right_twips = _cm_to_twips(ps.margin.right_cm)
-        gutter_twips = _cm_to_twips(ps.gutter_cm)
-        tab_pos = page_w_twips - left_twips - right_twips - gutter_twips
-
-        # 清除旧 TOC 段落，插入新内容，返回段落数变化量
-        delta = self._rebuild_toc(doc, doc_tree, toc_section,
-                                  entries, tab_pos, config, tracker)
 
         # 修正后续规则依赖的段落索引（TOC 重建改变了段落总数）
         if delta != 0:
@@ -1263,7 +1563,7 @@ class TocFormatRule(BaseRule):
                 except KeyError:
                     continue
 
-            style_key = LEVEL_TO_TOC_STYLE.get(level)
+            style_key = _toc_style_key_for_level(level)
             sc = config.styles.get(style_key) if style_key else None
             _format_toc_para(para, sc or StyleConfig())
             changed += 1
@@ -1292,6 +1592,7 @@ class TocFormatRule(BaseRule):
 
         # 检测旧 TOC 段落中是否包含分页符（w:br type="page"）
         had_page_break = _has_page_break(toc_elements)
+        preserved_sect_pr = _extract_last_toc_section_break(toc_elements)
 
         # 记录插入位置（在删除前获取索引）
         insert_idx = list(body_el).index(toc_elements[0])
@@ -1319,6 +1620,8 @@ class TocFormatRule(BaseRule):
         # 插入新元素
         for i, el in enumerate(new_elements):
             body_el.insert(insert_idx + i, el)
+        if new_elements:
+            _apply_section_break_to_para(new_elements[-1], preserved_sect_pr)
 
         # 格式化新段落（通过 doc.paragraphs 找到对应段落）
         self._format_new_toc(doc, new_elements, entries, config)
@@ -1338,6 +1641,76 @@ class TocFormatRule(BaseRule):
         old_count = len(toc_elements)
         new_count = len(new_elements)
         return new_count - old_count
+
+    def _rebuild_native_toc(
+        self,
+        doc,
+        toc_section,
+        config,
+        tracker,
+        *,
+        seed_entries: list[dict] | None = None,
+        tab_pos_twips: int = 9000,
+    ):
+        """重建为 Word 原生自动目录（TOC 域）。返回段落数变化量 delta。"""
+        body_el = doc.element.body
+
+        toc_start = toc_section.start_index
+        toc_end = toc_section.end_index
+        toc_elements = []
+        para_idx = 0
+        for child in list(body_el):
+            tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if tag == "p":
+                if toc_start <= para_idx <= toc_end:
+                    toc_elements.append(child)
+                para_idx += 1
+
+        if not toc_elements:
+            return 0
+
+        had_page_break = _has_page_break(toc_elements)
+        preserved_sect_pr = _extract_last_toc_section_break(toc_elements)
+        insert_idx = list(body_el).index(toc_elements[0])
+
+        for el in toc_elements:
+            body_el.remove(el)
+
+        new_elements = [
+            _build_toc_title_para("目录"),
+            _build_toc_field_begin_para(_native_toc_field_instruction(config)),
+        ]
+        for entry in seed_entries or []:
+            word_style = LEVEL_TO_WORD_STYLE.get(entry.get("level", "heading1"), "TOC 1")
+            new_elements.append(
+                _build_toc_entry_para(entry, tab_pos_twips, word_style)
+            )
+        new_elements.append(_build_toc_field_end_para())
+        if had_page_break:
+            new_elements.append(_build_page_break_para())
+
+        for i, el in enumerate(new_elements):
+            body_el.insert(insert_idx + i, el)
+        if new_elements:
+            _apply_section_break_to_para(new_elements[-1], preserved_sect_pr)
+
+        el_to_para = {p._element: p for p in doc.paragraphs}
+        title_para = el_to_para.get(new_elements[0])
+        if title_para:
+            title_sc = config.styles.get("toc_title") or StyleConfig()
+            _format_toc_para(title_para, title_sc, is_title=True)
+
+        tracker.record(
+            rule_name=self.name,
+            target="TOC 原生自动目录",
+            section="toc",
+            change_type="rebuild",
+            before=f"{len(toc_elements)} 个旧段落",
+            after="标题+TOC域(Word原生自动目录)",
+            paragraph_index=toc_start,
+        )
+
+        return len(new_elements) - len(toc_elements)
 
     @staticmethod
     def _fix_indices_after_toc(context, doc_tree, toc_section, delta):
@@ -1396,7 +1769,7 @@ class TocFormatRule(BaseRule):
                 except KeyError:
                     continue
 
-            style_key = LEVEL_TO_TOC_STYLE.get(entry["level"])
+            style_key = _toc_style_key_for_level(entry["level"])
             sc = config.styles.get(style_key) if style_key else None
             _format_toc_para(para, sc or StyleConfig())
 
@@ -1572,6 +1945,9 @@ class TocFormatRule(BaseRule):
             text = (para.text or "").strip()
             if level is None:
                 if _norm_no_space(text) in {"目录", "目次", "contents", "tableofcontents"}:
+                    toc_heading_style = _find_toc_heading_style(doc)
+                    if toc_heading_style is not None:
+                        para.style = toc_heading_style
                     sc_title = config.styles.get("toc_title")
                     if sc_title:
                         _format_toc_para(para, sc_title, is_title=True)
@@ -1586,6 +1962,12 @@ class TocFormatRule(BaseRule):
                     continue
             if level is None:
                 level = "heading1"
-            style_key = LEVEL_TO_TOC_STYLE.get(level)
+            for style_name_candidate in _toc_style_candidates(level):
+                try:
+                    para.style = doc.styles[style_name_candidate]
+                    break
+                except KeyError:
+                    continue
+            style_key = _toc_style_key_for_level(level)
             sc = config.styles.get(style_key) if style_key else None
             _format_toc_para(para, sc or StyleConfig())

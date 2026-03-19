@@ -17,6 +17,10 @@ from docx.shared import Pt
 from src.engine.change_tracker import ChangeTracker
 from src.engine.doc_tree import DocTree
 from src.engine.rules.base import BaseRule
+from src.engine.rules.table_format import (
+    _is_equation_table,
+    top_level_table_anchor_positions,
+)
 from src.scene.heading_model import (
     detect_level_by_style_name,
     get_front_matter_title_norms,
@@ -26,7 +30,9 @@ from src.scene.heading_model import (
     get_section_title_style_map,
 )
 from src.scene.schema import FormatScopeConfig, SceneConfig
-from src.utils.line_spacing import apply_line_spacing
+from src.utils.indent import apply_style_config_indents, style_config_indent_kwargs, sync_indent_ooxml
+from src.utils.line_spacing import apply_line_spacing, apply_safe_picture_line_spacing, sync_spacing_ooxml
+from src.utils.ooxml import apply_explicit_rfonts
 
 # section_type -> style key
 SECTION_STYLE_MAP = {
@@ -83,7 +89,7 @@ _RE_SUBFIG_REF_FULLWIDTH_SPACE = re.compile(
     r"(?P<num>\d+(?:\.\d+)+)\u3000(?P<label>[（(][A-Za-z][)）])"
 )
 
-_RE_REFERENCE_ENTRY_LINE = re.compile(r"^\s*(\[\d{1,4}\]|[（(]\d{1,4}[)）]|\d{1,4}\.)\s+\S")
+_RE_REFERENCE_ENTRY_LINE = re.compile(r"^\s*([\[\uFF3B]\s*\d{1,4}\s*[\]\uFF3D])\s+\S")
 _RE_TITLE_TAIL_MARKS = re.compile(r"[：:;；·•\-—_~\.。…]+$")
 _RE_ABSTRACT_CN_TITLE = re.compile(r"^\u6458\u8981(?:[（(][^()（）]{0,8}[)）])?$")
 _RE_ABSTRACT_EN_TITLE = re.compile(
@@ -171,15 +177,58 @@ _INTERNAL_CHEM_IGNORE_TOKENS = {
     "H5N1",
     "H3N2",
 }
-_INTERNAL_CHEM_ALLOW_TOKENS: set[str] = set()
+_INTERNAL_CHEM_ALLOW_TOKENS: set[str] = {
+    # Common isotope labels in thesis / paper writing.
+    "13C",
+    "14C",
+    "15N",
+    "18O",
+    "19F",
+    "29Si",
+    "31P",
+    "35S",
+    "57Fe",
+    "60Co",
+    "99Tc",
+    "99mTc",
+    # Labeled water / heavy-water forms.
+    "D2O",
+    "T2O",
+}
 _INTERNAL_CHEM_IGNORE_PATTERNS = [
     re.compile(r"^H\d{1,2}N\d{1,2}$"),  # Influenza subtype naming.
+    # Compact measurement-like tokens common in thesis methods/results sections.
+    re.compile(r"^\d{2,4}(?:W|V|K|N)$"),
+    re.compile(
+        r"^\d{2,4}(?:mV|kV|MV|GV|mA|kA|MA|mW|kW|MW|GW|Hz|kHz|MHz|GHz|Pa|kPa|MPa|GPa)$"
+    ),
     # Instrument/model codes.
     re.compile(r"^CHI\d{2,}[A-Z]*$"),
     re.compile(r"^LCMS\d{2,}[A-Z]*$"),
 ]
 _INTERNAL_CHEM_ALLOW_PATTERNS: list[re.Pattern[str]] = []
 _INTERNAL_CHEM_MANUAL_OVERRIDES = {
+    # Common light-element isotope shorthands.
+    "1H": "^.",
+    "2H": "^.",
+    "3H": "^.",
+    "3He": "^..",
+    "4He": "^..",
+    "2H2O": "^._.",
+    "3H2O": "^._.",
+    # Compact NMR shorthand frequently used in papers.
+    "1HNMR": "^....",
+    "13CNMR": "^^....",
+    "15NNMR": "^^....",
+    "19FNMR": "^^....",
+    "29SiNMR": "^^.....",
+    "31PNMR": "^^....",
+    "1H-NMR": "^.....",
+    "13C-NMR": "^^.....",
+    "15N-NMR": "^^.....",
+    "19F-NMR": "^^.....",
+    "29Si-NMR": "^^......",
+    "31P-NMR": "^^.....",
     # Singlet oxygen: leading isotope/singlet marker + oxygen count.
     "1O2": "^._",
     # Radical forms often represented with a raised dot and sign.
@@ -245,6 +294,54 @@ _RE_SIMPLE_UNIT_CONNECT_TOKEN = re.compile(
 _RE_PERCENT_SHORT_UNIT = re.compile(r"^(?:wt|vol|at)%$", re.IGNORECASE)
 _RE_PERCENT_BRACKET_UNIT = re.compile(r"^%\((?:w|v)/(?:w|v)\)$", re.IGNORECASE)
 _PLAIN_UNIT_WORDS = {"ppm", "ppb", "ppt", "ppmv", "ppbv", "pptr"}
+_KNOWN_UNIT_SEGMENTS = {
+    "m", "cm", "mm", "km", "nm", "pm",
+    "μm", "um",
+    "g", "kg", "mg", "ng", "pg",
+    "μg", "ug",
+    "l", "ml", "nl", "pl",
+    "μl", "ul",
+    "mol", "mmol", "nmol", "pmol",
+    "μmol", "umol",
+    "moll",  # tolerate rare OCR-like collapse before cleanup
+    "s", "ms", "ns", "ps", "min", "h", "d",
+    "hz", "khz", "mhz", "ghz",
+    "pa", "kpa", "mpa", "gpa", "bar", "mbar",
+    "ev", "kev", "mev", "gev",
+    "ma", "mv", "kw", "kj",
+    "ma", "ms", "mpa", "mm", "ml",
+    "°c", "℃",
+    "ω", "kω", "mω", "μs", "us",
+    "wt%", "vol%", "at%", "%",
+}
+_ALLOWED_NEUTRAL_COMPACT_TAILS = {"O", "N", "S", "H", "F", "I"}
+_COMMON_SINGLE_LETTER_FORMULA_TOKENS = {"H2", "N2", "O2", "O3"}
+_RE_APPENDIX_LABEL_TOKEN = re.compile(r"^[A-Z]-\d{1,3}$")
+_RE_PREFIXED_APPENDIX_LABEL_TOKEN = re.compile(r"^(?:Fig\.?|Table|Appendix|图|表)[A-Z]-\d{1,3}$", re.IGNORECASE)
+_RE_DOMAIN_LIKE_TOKEN = re.compile(r"^(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,24}$")
+_RE_COMPACT_SINGLE_LETTER_ISOTOPE_TOKEN = re.compile(r"^\d{1,3}[A-Z]$")
+_RE_SHORT_IDENTIFIER_TOKEN = re.compile(r"^[A-Z]\d{1,3}$")
+_RE_HISTONE_MARK_TOKEN = re.compile(r"^H[1-4](?:K|R|Q|N|S|T)\d{1,3}$", re.IGNORECASE)
+_SINGLE_LETTER_ELEMENT_ATOMIC_NUMBERS = {
+    "H": 1,
+    "B": 5,
+    "C": 6,
+    "N": 7,
+    "O": 8,
+    "F": 9,
+    "P": 15,
+    "S": 16,
+    "K": 19,
+    "V": 23,
+    "Y": 39,
+    "I": 53,
+    "W": 74,
+    "U": 92,
+}
+# For spaced compacted spans like "40 K" / "220 V", prefer the common unit
+# interpretation over isotope recovery. Compact no-space forms like "14C" are
+# still handled by the normal token recognizer.
+_COMMON_SPACED_SINGLE_LETTER_UNIT_SYMBOLS = {"K", "V", "W"}
 
 ChemRuntime = tuple[
     set[str],  # ignore_tokens
@@ -261,10 +358,88 @@ def _run_has_no_proof(run) -> bool:
     return rpr is not None and rpr.find(f"{{{_W_NS}}}noProof") is not None
 
 
+def _run_has_explicit_font_binding(run) -> bool:
+    rpr = run._element.find(f"{{{_W_NS}}}rPr")
+    if rpr is None:
+        return False
+    rfonts = rpr.find(f"{{{_W_NS}}}rFonts")
+    if rfonts is None:
+        return False
+    for attr in (
+        "ascii", "hAnsi", "eastAsia", "cs",
+        "asciiTheme", "hAnsiTheme", "eastAsiaTheme", "csTheme", "cstheme",
+    ):
+        if rfonts.get(f"{{{_W_NS}}}{attr}"):
+            return True
+    return False
+
+
 def _para_has_num_pr(para) -> bool:
     """List paragraphs should keep list indentation/formatting."""
     ppr = para._element.find(f"{{{_W_NS}}}pPr")
     return ppr is not None and ppr.find(f"{{{_W_NS}}}numPr") is not None
+
+
+def _paragraph_el_has_num_pr(p_el) -> bool:
+    ppr = p_el.find(f"{{{_W_NS}}}pPr")
+    return ppr is not None and ppr.find(f"{{{_W_NS}}}numPr") is not None
+
+
+def _paragraph_el_text(p_el) -> str:
+    parts: list[str] = []
+    for t_el in p_el.iter(f"{{{_W_NS}}}t"):
+        txt = t_el.text or ""
+        if txt:
+            parts.append(txt)
+    return "".join(parts).strip()
+
+
+def _paragraph_el_has_nontext_content(p_el) -> bool:
+    if p_el.findall(f"{{{_M_NS}}}oMathPara") or p_el.findall(f"{{{_M_NS}}}oMath"):
+        return True
+    if p_el.findall(f"{{{_W_NS}}}r/{{{_W_NS}}}object"):
+        return True
+    if p_el.findall(f"{{{_W_NS}}}r/{{{_W_NS}}}pict"):
+        return True
+    if p_el.findall(f"{{{_W_NS}}}r/{{{_W_NS}}}drawing"):
+        return True
+    if p_el.findall(f".//{{{_WP_NS}}}inline") or p_el.findall(f".//{{{_WP_NS}}}anchor"):
+        return True
+    return False
+
+
+def _neighbor_para_el(p_el, *, next_para: bool):
+    cur = p_el.getnext() if next_para else p_el.getprevious()
+    while cur is not None:
+        tag = getattr(cur, "tag", "")
+        if isinstance(tag, str):
+            local = etree.QName(tag).localname
+            if local == "p":
+                return cur
+            if local in {"tbl", "sectPr"}:
+                return None
+        cur = cur.getnext() if next_para else cur.getprevious()
+    return None
+
+
+def _para_has_adjacent_list_marker(para) -> bool:
+    """Detect markdown/web imported list items whose marker is in adjacent empty numPr para."""
+    if _para_has_num_pr(para):
+        return True
+    if not (para.text or "").strip():
+        return False
+
+    p_el = para._element
+    for next_para in (False, True):
+        sibling = _neighbor_para_el(p_el, next_para=next_para)
+        if sibling is None:
+            continue
+        if not _paragraph_el_has_num_pr(sibling):
+            continue
+        if _paragraph_el_text(sibling):
+            continue
+        return True
+    return False
 
 
 def _clear_para_num_pr(para) -> None:
@@ -283,7 +458,7 @@ def _para_is_special_block(para) -> bool:
     if ppr is not None and ppr.find(f"{{{_W_NS}}}pBdr") is not None:
         return True
     for run in para.runs:
-        if _run_has_no_proof(run):
+        if _run_has_no_proof(run) and _run_has_explicit_font_binding(run):
             return True
     return False
 
@@ -548,48 +723,115 @@ def _center_paragraph(para):
     pf.left_indent = None
 
 
-def _normalize_reference_entry_paragraph(para) -> bool:
-    """Force reference entry layout: left aligned, no first-line/list indentation."""
+def _normalize_reference_entry_paragraph(para, style_config=None) -> bool:
+    """Force reference entry layout and isolate it from body-indent spillover."""
     text = (para.text or "").strip()
     if not text or not _looks_like_reference_entry(text):
         return False
 
     _clear_para_num_pr(para)
+    style_name = (para.style.name or "") if para.style else ""
+    style_id = (getattr(para.style, "style_id", "") or "") if para.style else ""
+    style_name_low = style_name.lower()
+    style_id_low = style_id.lower()
+    if "list" in style_name_low or "list" in style_id_low or "列表" in style_name:
+        try:
+            para.style = "Normal"
+        except Exception:
+            pass
     pf = para.paragraph_format
-    pf.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    pf.first_line_indent = Pt(0)
-    pf.left_indent = Pt(0)
-    pf.right_indent = Pt(0)
-    _sanitize_para_indent_ooxml(para, force_zero=True)
+    if style_config is None:
+        pf.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        pf.first_line_indent = Pt(0)
+        pf.left_indent = Pt(0)
+        pf.right_indent = Pt(0)
+        _sanitize_para_indent_ooxml(para, force_zero=True)
+        return True
+
+    align_key = getattr(style_config, "alignment", "left")
+    pf.alignment = ALIGNMENT_MAP.get(align_key, WD_ALIGN_PARAGRAPH.LEFT)
+    pf.space_before = Pt(getattr(style_config, "space_before_pt", 0.0))
+    pf.space_after = Pt(getattr(style_config, "space_after_pt", 0.0))
+    apply_line_spacing(
+        pf,
+        getattr(style_config, "line_spacing_type", "exact"),
+        getattr(style_config, "line_spacing_pt", 20.0),
+    )
+    sync_spacing_ooxml(
+        para._element,
+        space_before_pt=getattr(style_config, "space_before_pt", 0.0),
+        space_after_pt=getattr(style_config, "space_after_pt", 0.0),
+        line_spacing_type=getattr(style_config, "line_spacing_type", "exact"),
+        line_spacing_value=getattr(style_config, "line_spacing_pt", 20.0),
+    )
+    left_pt, first_pt, hanging_pt, right_pt = apply_style_config_indents(pf, para._element, style_config)
+    _sanitize_para_indent_ooxml(
+        para,
+        force_zero=left_pt <= 0 and first_pt <= 0 and hanging_pt <= 0 and right_pt <= 0,
+        **style_config_indent_kwargs(style_config),
+    )
     return True
 
 
-def _sanitize_para_indent_ooxml(para, *, force_zero: bool = False) -> None:
-    """Clear legacy char-based indents; optionally force paragraph indent to zero."""
+def _sanitize_para_indent_ooxml(
+    para,
+    *,
+    force_zero: bool = False,
+    left_value: float | None = None,
+    left_unit: str = "chars",
+    first_line_value: float | None = None,
+    first_line_unit: str = "chars",
+    hanging_value: float | None = None,
+    hanging_unit: str = "chars",
+    right_value: float | None = None,
+    right_unit: str = "chars",
+    size_pt: float = 12.0,
+) -> None:
+    """Clear legacy char-based indents and optionally sync explicit paragraph indent."""
     ppr = para._element.find(f"{{{_W_NS}}}pPr")
     if ppr is None:
-        if not force_zero:
+        if (
+            not force_zero
+            and left_value is None
+            and first_line_value is None
+            and hanging_value is None
+            and right_value is None
+        ):
             return
         ppr = etree.SubElement(para._element, f"{{{_W_NS}}}pPr")
     ind = ppr.find(f"{{{_W_NS}}}ind")
     if ind is None:
-        if not force_zero:
+        if (
+            not force_zero
+            and left_value is None
+            and first_line_value is None
+            and hanging_value is None
+            and right_value is None
+        ):
             return
         ind = etree.SubElement(ppr, f"{{{_W_NS}}}ind")
-
-    if force_zero:
-        ind.set(f"{{{_W_NS}}}left", "0")
-        ind.set(f"{{{_W_NS}}}right", "0")
-        ind.set(f"{{{_W_NS}}}firstLine", "0")
-        ind.set(f"{{{_W_NS}}}hanging", "0")
-
-    # Character-based indent attrs can survive style rewriting and visually keep indentation.
-    for char_attr in ("leftChars", "rightChars", "firstLineChars", "hangingChars"):
-        ind.attrib.pop(f"{{{_W_NS}}}{char_attr}", None)
+    sync_indent_ooxml(
+        para._element,
+        left_value=left_value or 0.0,
+        left_unit=left_unit,
+        first_line_value=first_line_value or 0.0,
+        first_line_unit=first_line_unit,
+        hanging_value=hanging_value or 0.0,
+        hanging_unit=hanging_unit,
+        right_value=right_value or 0.0,
+        right_unit=right_unit,
+        size_pt=size_pt,
+        force_zero=force_zero,
+    )
 
 
 def _center_table(table):
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+
+def _table_anchor_positions(doc: Document) -> list[int]:
+    """Map top-level tables to nearby paragraph indices with leading-table safety."""
+    return top_level_table_anchor_positions(doc)
 
 
 def _para_has_sectpr(para) -> bool:
@@ -622,6 +864,37 @@ def _has_nonempty_content(doc, start_idx: int, end_idx: int) -> bool:
     for i in range(max(0, start_idx), end + 1):
         if (doc.paragraphs[i].text or "").strip():
             return True
+    return False
+
+
+def _has_nonempty_body_content_after_paragraph(
+    doc,
+    para_idx: int,
+    *,
+    stop_before_para_idx: int | None = None,
+) -> bool:
+    if para_idx < 0 or para_idx >= len(doc.paragraphs):
+        return False
+
+    start_el = doc.paragraphs[para_idx]._element
+    stop_el = None
+    if stop_before_para_idx is not None and 0 <= stop_before_para_idx < len(doc.paragraphs):
+        stop_el = doc.paragraphs[stop_before_para_idx]._element
+
+    curr = start_el.getnext()
+    while curr is not None and curr is not stop_el:
+        tag = getattr(curr, "tag", "")
+        if not isinstance(tag, str):
+            curr = curr.getnext()
+            continue
+        local = etree.QName(tag).localname
+        if local == "tbl":
+            return True
+        if local == "p" and (
+            _paragraph_el_text(curr) or _paragraph_el_has_nontext_content(curr)
+        ):
+            return True
+        curr = curr.getnext()
     return False
 
 
@@ -664,22 +937,18 @@ def _remove_caption_table_section_breaks(doc) -> int:
 
 
 def _apply_run_font(run, font_cn: str, font_en: str, size_pt: float):
-    if _run_has_no_proof(run):
+    if _run_has_no_proof(run) and _run_has_explicit_font_binding(run):
         return
     run.font.name = font_en
     run.font.size = Pt(size_pt)
     rpr = run._element.find(f"{{{_W_NS}}}rPr")
     if rpr is None:
         rpr = etree.SubElement(run._element, f"{{{_W_NS}}}rPr")
-    rfonts = rpr.find(f"{{{_W_NS}}}rFonts")
-    if rfonts is None:
-        rfonts = etree.SubElement(rpr, f"{{{_W_NS}}}rFonts")
-    rfonts.set(f"{{{_W_NS}}}eastAsia", font_cn)
-    rfonts.set(f"{{{_W_NS}}}ascii", font_en)
-    rfonts.set(f"{{{_W_NS}}}hAnsi", font_en)
-    rfonts.set(f"{{{_W_NS}}}cs", font_en)
-    for attr in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "csTheme", "cstheme"):
-        rfonts.attrib.pop(f"{{{_W_NS}}}{attr}", None)
+    apply_explicit_rfonts(
+        rpr,
+        font_cn=font_cn,
+        font_en=font_en,
+    )
 
 
 def _run_vert_align(run) -> str | None:
@@ -892,6 +1161,8 @@ def _is_formula_like_token_without_arrow(
     t = _normalize_formula_token_chars(token or "")
     if not t:
         return False
+    if _is_ambiguous_neutral_compact_token(t):
+        return False
     if _is_radical_token_candidate(t):
         return True
     if _is_bond_like_chem_token(t):
@@ -990,6 +1261,8 @@ def _resolve_chem_token_policy(
         or _token_matches_patterns(allow_patterns, token, normalized_token)
     )
     if not is_allowed:
+        if _looks_like_ambiguous_identifier_token(token):
+            return False, ""
         if normalized_token in ignore_tokens:
             return False, ""
         if _token_matches_patterns(ignore_patterns, token, normalized_token):
@@ -1574,6 +1847,36 @@ def _token_has_unit_symbol_hint(token: str) -> bool:
     return any(ch in {"µ", "μ", "Ω", "ω", "%", "‰"} for ch in t)
 
 
+def _normalize_unit_segment_key(unit_text: str) -> str:
+    t = _normalize_formula_token_chars(unit_text or "")
+    t = re.sub(r"\s+", "", t)
+    if not t:
+        return ""
+    t = t.replace("µ", "μ")
+    return t
+
+
+def _is_known_unit_segment(unit_text: str) -> bool:
+    """Conservative whitelist for unit stems before applying exponent typography."""
+    key = _normalize_unit_segment_key(unit_text)
+    if not key:
+        return False
+
+    key_low = key.lower()
+    if key_low in _KNOWN_UNIT_SEGMENTS:
+        return True
+    if _looks_like_plain_unit_token(key):
+        return True
+
+    if key.startswith("(") and key.endswith(")") and len(key) > 2:
+        inner = key[1:-1]
+        if _looks_like_plain_unit_token(key):
+            return True
+        if re.fullmatch(r"[A-Za-zμΩω%·\./]+", inner or ""):
+            return True
+    return False
+
+
 def _build_token_unit_formula_marks(token: str, right_char: str = "") -> list[str | None]:
     """Recognize scientific unit expressions and mark exponent part.
 
@@ -1635,6 +1938,7 @@ def _build_token_unit_formula_marks(token: str, right_char: str = "") -> list[st
                 i += 1
             if i == seg_start:
                 return [None] * n
+        unit_text = token[seg_start:i]
 
         exp_start = i
         if i < n and token[i] == "^":
@@ -1664,18 +1968,17 @@ def _build_token_unit_formula_marks(token: str, right_char: str = "") -> list[st
 
         # Signed exponent in unit expression, e.g. g-1 / mA-2.
         if has_sign and i > d0:
+            if not _is_known_unit_segment(unit_text):
+                return [None] * n
             _mark_unit_exp(exp_start, i)
             has_mark = True
         elif i > d0:
             # Bare positive exponent, e.g. cm2/m3. Keep this conservative.
-            unit_text = token[seg_start:d0]
-            has_lower = any(_is_ascii_lower(ch) for ch in unit_text)
-            if (
-                (has_lower and len(unit_text) <= 3)
-                or any(ch in {"µ", "μ"} for ch in unit_text)
-                or any(sep in token for sep in ("·", "•"))
-                or unit_text.startswith("(")
-            ):
+            if _is_known_unit_segment(unit_text):
+                if i < n and (_is_unit_symbol_char(token[i]) or token[i] == "("):
+                    nested = _build_token_unit_formula_marks(token[i:], right_char=right_char)
+                    if not any(nested):
+                        return [None] * n
                 _mark_unit_exp(d0, i)
                 has_mark = True
             else:
@@ -1836,6 +2139,9 @@ def _build_token_formula_marks(
                 hybrid_marks[idx] = "superscript"
         return hybrid_marks
 
+    if _is_ambiguous_neutral_compact_token(token):
+        return [None] * n
+
     radical_marks = _build_token_radical_marks(
         token,
         right_char=right_char,
@@ -1918,6 +2224,88 @@ def _looks_like_instrument_model_token(token: str) -> bool:
     return prefix in _INSTRUMENT_MODEL_PREFIXES
 
 
+def _looks_like_domain_like_token(token: str) -> bool:
+    t = _normalize_formula_token_chars((token or "").strip())
+    if not t:
+        return False
+    return bool(_RE_DOMAIN_LIKE_TOKEN.fullmatch(t))
+
+
+def _is_ambiguous_neutral_compact_token(token: str) -> bool:
+    """Skip aggressive neutral-token recovery for identifier-like compact tokens."""
+    t = _normalize_formula_token_chars((token or "").strip())
+    if not t:
+        return False
+    if any(ch in t for ch in (_CHARGE_SIGNS + "^()[]{}" + _DOT_SEPARATORS + "/%")):
+        return False
+    if not re.fullmatch(r"[A-Z0-9]+", t):
+        return False
+
+    if re.fullmatch(r"[A-Z]\d+[A-Z]{2,}", t):
+        return True
+
+    if re.fullmatch(r"[A-Z]\d+[A-Z]", t):
+        return t[-1] not in _ALLOWED_NEUTRAL_COMPACT_TAILS
+
+    return False
+
+
+def _looks_like_ambiguous_identifier_token(token: str) -> bool:
+    """Conservative skip-list for non-chemical labels frequently seen in docs."""
+    t = _normalize_formula_token_chars((token or "").strip())
+    if not t:
+        return False
+    if _RE_APPENDIX_LABEL_TOKEN.fullmatch(t):
+        return True
+    if _RE_PREFIXED_APPENDIX_LABEL_TOKEN.fullmatch(t):
+        return True
+    if _looks_like_domain_like_token(t):
+        return True
+    if any(ch in t for ch in (_CHARGE_SIGNS + "^()[]{}" + _DOT_SEPARATORS + "/%")):
+        return False
+    if not t.isascii():
+        return False
+
+    t_upper = t.upper()
+    if _RE_HISTONE_MARK_TOKEN.fullmatch(t_upper):
+        return True
+    if _RE_SHORT_IDENTIFIER_TOKEN.fullmatch(t_upper):
+        return t_upper not in _COMMON_SINGLE_LETTER_FORMULA_TOKENS
+    return False
+
+
+def _looks_like_spaced_single_letter_isotope_noise(span_text: str, compact_token: str) -> bool:
+    """Skip compacted number+single-letter spans produced by wide alignment gaps."""
+    span = _normalize_formula_token_chars((span_text or "").strip())
+    compact = _normalize_formula_token_chars((compact_token or "").strip())
+    if not span or not compact:
+        return False
+    if not _RE_COMPACT_SINGLE_LETTER_ISOTOPE_TOKEN.fullmatch(compact):
+        return False
+    if bool(re.search(r"\s{2,}", span)):
+        return True
+
+    if re.fullmatch(r"\d+\s+[A-Z]", span) and compact[-1] in _COMMON_SPACED_SINGLE_LETTER_UNIT_SYMBOLS:
+        return True
+
+    symbol = compact[-1]
+    mass = int(compact[:-1])
+    if symbol == "D":
+        return mass != 2
+    if symbol == "T":
+        return mass != 3
+
+    atomic_number = _SINGLE_LETTER_ELEMENT_ATOMIC_NUMBERS.get(symbol)
+    if atomic_number is None:
+        return True
+
+    # Conservative plausibility guard for compacted spaced isotopes. This keeps
+    # common cases like 14 C / 15 N while filtering obvious measurement values
+    # such as 300 W / 220 V / 300 N.
+    upper_bound = max(atomic_number, (28 * atomic_number + 9) // 10)  # ceil(2.8 * Z)
+    return not (atomic_number <= mass <= upper_bound)
+
+
 def _build_chem_style_marks(
     text: str,
     chem_cfg=None,
@@ -1951,6 +2339,8 @@ def _build_chem_style_marks(
                 marks[abs_start + i] = style
 
     for span_start, span_end, span_text, compact_raw, compact_norm in _iter_compacted_formula_spans(text):
+        if _looks_like_spaced_single_letter_isotope_noise(span_text, compact_raw):
+            continue
         right_char = text[span_end] if span_end < len(text) else ""
         right_non_space_char = _first_non_space_char(text[span_end:])
         use_span, manual_mask = _resolve_chem_token_policy(compact_raw, compact_norm, runtime)
@@ -2017,6 +2407,8 @@ def _build_chem_font_mask(
             mask[i] = True
 
     for span_start, span_end, span_text, compact_raw, compact_norm in _iter_compacted_formula_spans(text):
+        if _looks_like_spaced_single_letter_isotope_noise(span_text, compact_raw):
+            continue
         right_char = text[span_end] if span_end < len(text) else ""
         right_non_space_char = _first_non_space_char(text[span_end:])
         use_span, manual_mask = _resolve_chem_token_policy(compact_raw, compact_norm, runtime)
@@ -2078,6 +2470,88 @@ def _resolve_run_ascii_font(run_el) -> str | None:
     return None
 
 
+def _normalize_explicit_run_font_hints_in_root(root) -> int:
+    changed = 0
+    hint_q = f"{{{_W_NS}}}hint"
+    explicit_attrs = ("ascii", "hAnsi", "eastAsia", "cs")
+    theme_attrs = ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "csTheme", "cstheme")
+    for run_el in root.iter(f"{{{_W_NS}}}r"):
+        rpr = run_el.find(f"{{{_W_NS}}}rPr")
+        if rpr is None:
+            continue
+        rfonts = rpr.find(f"{{{_W_NS}}}rFonts")
+        if rfonts is None:
+            continue
+        hint = str(rfonts.get(hint_q) or "").strip().lower()
+        if hint != "eastasia":
+            continue
+        if not any(rfonts.get(f"{{{_W_NS}}}{attr}") for attr in explicit_attrs):
+            continue
+        rfonts.set(hint_q, "default")
+        for attr in theme_attrs:
+            q = f"{{{_W_NS}}}{attr}"
+            if q in rfonts.attrib:
+                rfonts.attrib.pop(q, None)
+        changed += 1
+    return changed
+
+
+def _normalize_explicit_run_font_hints(doc: Document) -> int:
+    return _normalize_explicit_run_font_hints_in_root(doc.element.body)
+
+
+def _normalize_related_story_part_font_hints(doc: Document) -> dict[str, int]:
+    changed_parts: dict[str, int] = {}
+    seen_partnames: set[str] = set()
+    target_exact = {
+        "/word/comments.xml",
+        "/word/footnotes.xml",
+        "/word/endnotes.xml",
+    }
+    target_prefixes = (
+        "/word/header",
+        "/word/footer",
+    )
+
+    for rel in doc.part.rels.values():
+        part = getattr(rel, "target_part", None)
+        partname = str(getattr(part, "partname", "") or "")
+        if not partname or partname in seen_partnames:
+            continue
+        if partname not in target_exact and not any(
+            partname.startswith(prefix) for prefix in target_prefixes
+        ):
+            continue
+        seen_partnames.add(partname)
+
+        root = getattr(part, "element", None)
+        writeback_blob = False
+        if root is None:
+            blob = getattr(part, "blob", None)
+            if not blob:
+                continue
+            try:
+                root = etree.fromstring(blob)
+            except Exception:
+                continue
+            writeback_blob = True
+
+        part_changes = _normalize_explicit_run_font_hints_in_root(root)
+        if not part_changes:
+            continue
+
+        changed_parts[partname] = part_changes
+        if writeback_blob:
+            part._blob = etree.tostring(
+                root,
+                encoding="UTF-8",
+                xml_declaration=True,
+                standalone=True,
+            )
+
+    return changed_parts
+
+
 def _set_run_all_fonts(run_el, font_name: str) -> bool:
     if not font_name:
         return False
@@ -2095,6 +2569,10 @@ def _set_run_all_fonts(run_el, font_name: str) -> bool:
         if rfonts.get(q) != font_name:
             rfonts.set(q, font_name)
             changed = True
+    hint_q = f"{{{_W_NS}}}hint"
+    if rfonts.get(hint_q) != "default":
+        rfonts.set(hint_q, "default")
+        changed = True
     for attr in ("asciiTheme", "hAnsiTheme", "eastAsiaTheme", "csTheme", "cstheme"):
         q = f"{{{_W_NS}}}{attr}"
         if q in rfonts.attrib:
@@ -2305,6 +2783,9 @@ class SectionFormatRule(BaseRule):
         scope: FormatScopeConfig = context.get("format_scope", config.format_scope)
         has_caption_index_context = "caption_indices" in context
         caption_indices = set(context.get("caption_indices", set()))
+        target_indices = context.get("target_paragraph_indices")
+        if target_indices is not None:
+            target_indices = set(target_indices)
 
         chem_cfg = getattr(config, "chem_typography", None)
         if chem_cfg is None:
@@ -2315,7 +2796,15 @@ class SectionFormatRule(BaseRule):
             raw_scopes = getattr(chem_cfg, "scopes", {}) or {}
             chem_scopes = {
                 key
-                for key in ("references", "body", "headings", "abstract_cn", "abstract_en")
+                for key in (
+                    "references",
+                    "body",
+                    "headings",
+                    "abstract_cn",
+                    "abstract_en",
+                    "captions",
+                    "tables",
+                )
                 if bool(raw_scopes.get(key, False))
             }
             if bool(raw_scopes.get("abstract", False)):
@@ -2324,9 +2813,30 @@ class SectionFormatRule(BaseRule):
             chem_scopes = set()
         chem_runtime = _build_chem_dictionary_runtime(chem_cfg)
 
-        chem_para_count = {"references": 0, "body": 0, "headings": 0, "abstract": 0}
-        chem_mark_char_count = {"references": 0, "body": 0, "headings": 0, "abstract": 0}
-        chem_font_char_count = {"references": 0, "body": 0, "headings": 0, "abstract": 0}
+        chem_para_count = {
+            "references": 0,
+            "body": 0,
+            "headings": 0,
+            "abstract": 0,
+            "captions": 0,
+            "tables": 0,
+        }
+        chem_mark_char_count = {
+            "references": 0,
+            "body": 0,
+            "headings": 0,
+            "abstract": 0,
+            "captions": 0,
+            "tables": 0,
+        }
+        chem_font_char_count = {
+            "references": 0,
+            "body": 0,
+            "headings": 0,
+            "abstract": 0,
+            "captions": 0,
+            "tables": 0,
+        }
 
         def _apply_chem_restore(scope_key: str, para_obj, *, metric_key: str | None = None) -> None:
             if scope_key not in chem_scopes:
@@ -2352,14 +2862,6 @@ class SectionFormatRule(BaseRule):
         for section in doc_tree.sections:
             sec_type = section.section_type
             if not scope.is_section_enabled(sec_type):
-                if sec_type in {"abstract_cn", "abstract_en"} and sec_type in chem_scopes:
-                    for i in section.paragraph_range:
-                        if i >= len(doc.paragraphs):
-                            break
-                        para = doc.paragraphs[i]
-                        if not (para.text or "").strip():
-                            continue
-                        _apply_chem_restore(sec_type, para, metric_key="abstract")
                 continue
 
             style_key = SECTION_STYLE_MAP.get(sec_type)
@@ -2371,6 +2873,8 @@ class SectionFormatRule(BaseRule):
             for i in section.paragraph_range:
                 if i >= len(doc.paragraphs):
                     break
+                if target_indices and i not in target_indices:
+                    continue
 
                 para = doc.paragraphs[i]
                 if not (para.text or "").strip():
@@ -2401,6 +2905,7 @@ class SectionFormatRule(BaseRule):
                 if sec_type == "body":
                     if has_caption_index_context:
                         if i in caption_indices:
+                            _apply_chem_restore("captions", para)
                             continue
                         if _para_is_caption(para):
                             text = (para.text or "").strip()
@@ -2412,8 +2917,10 @@ class SectionFormatRule(BaseRule):
                                 _center_paragraph(para)
                                 for run in para.runs:
                                     _apply_run_font(run, cap_sc.font_cn, cap_sc.font_en, cap_sc.size_pt)
+                            _apply_chem_restore("captions", para)
                             continue
                     elif _para_is_caption(para):
+                        _apply_chem_restore("captions", para)
                         continue
 
                 if sec_type == "body" and _para_is_equation(para):
@@ -2506,11 +3013,55 @@ class SectionFormatRule(BaseRule):
                 paragraph_index=-1,
             )
 
+        if "tables" in chem_scopes:
+            anchor_positions = _table_anchor_positions(doc)
+            for tbl_idx, table in enumerate(doc.tables):
+                if _is_equation_table(table._tbl):
+                    continue
+                pos = anchor_positions[tbl_idx] if tbl_idx < len(anchor_positions) else -1
+                if target_indices and (pos < 0 or pos not in target_indices):
+                    continue
+                if pos < 0:
+                    continue
+                table_sec_type = "body"
+                if doc_tree:
+                    table_sec_type = doc_tree.get_section_for_paragraph(pos)
+                if not scope.is_section_enabled(table_sec_type):
+                    continue
+
+                seen_cells: set[int] = set()
+                for row in table.rows:
+                    for cell in row.cells:
+                        cell_id = id(cell._tc)
+                        if cell_id in seen_cells:
+                            continue
+                        seen_cells.add(cell_id)
+                        for para in cell.paragraphs:
+                            if not (para.text or "").strip():
+                                continue
+                            _apply_chem_restore("tables", para)
+
+        hint_fixed_runs = _normalize_explicit_run_font_hints(doc)
+        related_hint_fixed_runs = _normalize_related_story_part_font_hints(doc)
+        total_hint_fixed_runs = hint_fixed_runs + sum(related_hint_fixed_runs.values())
+        if total_hint_fixed_runs:
+            tracker.record(
+                rule_name=self.name,
+                target=f"{total_hint_fixed_runs} runs",
+                section="global",
+                change_type="format",
+                before="w:hint=eastAsia",
+                after="normalize explicit run hint to default",
+                paragraph_index=-1,
+            )
+
         for scope_key, label, sec in (
             ("references", "参考文献", "references"),
             ("body", "正文", "body"),
             ("abstract", "摘要/Abstract", "global"),
             ("headings", "标题", "global"),
+            ("captions", "题注", "body"),
+            ("tables", "表格", "body"),
         ):
             if chem_para_count[scope_key] <= 0:
                 continue
@@ -2527,67 +3078,98 @@ class SectionFormatRule(BaseRule):
                 paragraph_index=-1,
             )
 
-        self._enforce_reference_entries_no_indent(doc, doc_tree, tracker)
-        self._format_front_matter_title_fallback(
-            doc,
-            doc_tree,
-            config,
-            scope,
-            tracker,
-            section_title_style_map=section_title_style_map,
-            front_matter_title_norms=front_matter_title_norms,
-            non_numbered_sections=non_numbered_sections,
-            non_numbered_title_norms=non_numbered_title_norms,
-        )
-        self._ensure_front_title_section_breaks(doc, doc_tree, tracker)
-        self._ensure_chapter_section_breaks(doc, doc_tree, tracker)
-        self._ensure_post_title_section_breaks(doc, doc_tree, tracker)
-        removed_caption_breaks = _remove_caption_table_section_breaks(doc)
-        if removed_caption_breaks:
-            tracker.record(
-                rule_name=self.name,
-                target=f"{removed_caption_breaks} 个题注段落",
-                section="body",
-                change_type="section_break",
-                before="题注与表格之间存在分节符",
-                after="已清理异常分节符",
-                paragraph_index=-1,
+        if not target_indices:
+            self._enforce_reference_entries_no_indent(
+                doc,
+                doc_tree,
+                tracker,
+                scope=scope,
             )
-        self._center_figures_and_tables(
-            doc,
-            tracker,
-            caption_indices=caption_indices,
-            has_caption_index_context=has_caption_index_context,
-        )
+            self._format_front_matter_title_fallback(
+                doc,
+                doc_tree,
+                config,
+                scope,
+                tracker,
+                section_title_style_map=section_title_style_map,
+                front_matter_title_norms=front_matter_title_norms,
+                non_numbered_sections=non_numbered_sections,
+                non_numbered_title_norms=non_numbered_title_norms,
+            )
+            self._ensure_front_title_section_breaks(doc, doc_tree, tracker)
+            self._ensure_chapter_section_breaks(doc, doc_tree, tracker)
+            self._ensure_post_title_section_breaks(doc, doc_tree, tracker)
+            removed_caption_breaks = _remove_caption_table_section_breaks(doc)
+            if removed_caption_breaks:
+                tracker.record(
+                    rule_name=self.name,
+                    target=f"{removed_caption_breaks} 个题注段落",
+                    section="body",
+                    change_type="section_break",
+                    before="题注与表格之间存在分节符",
+                    after="已清理异常分节符",
+                    paragraph_index=-1,
+                )
+            self._center_figures_and_tables(
+                doc,
+                tracker,
+                doc_tree=doc_tree,
+                scope=scope,
+                caption_indices=caption_indices,
+                has_caption_index_context=has_caption_index_context,
+            )
 
     def _center_figures_and_tables(
         self,
         doc,
         tracker,
+        doc_tree=None,
+        scope: FormatScopeConfig | None = None,
         caption_indices: set[int] | None = None,
         has_caption_index_context: bool = False,
     ):
+        def _section_enabled_for_paragraph(idx: int) -> bool:
+            if scope is None or doc_tree is None:
+                return True
+            sec_type = doc_tree.get_section_for_paragraph(idx)
+            return sec_type == "unknown" or scope.is_section_enabled(sec_type)
+
         fig_count = 0
 
-        for para in doc.paragraphs:
+        for i, para in enumerate(doc.paragraphs):
+            if not _section_enabled_for_paragraph(i):
+                continue
             if _para_has_image(para):
                 _center_paragraph(para)
+                apply_safe_picture_line_spacing(para)
                 fig_count += 1
 
         if has_caption_index_context:
             for i in sorted(caption_indices or set()):
                 if 0 <= i < len(doc.paragraphs):
+                    if not _section_enabled_for_paragraph(i):
+                        continue
                     _center_paragraph(doc.paragraphs[i])
                     fig_count += 1
         else:
-            for para in doc.paragraphs:
+            for i, para in enumerate(doc.paragraphs):
+                if not _section_enabled_for_paragraph(i):
+                    continue
                 text = (para.text or "").strip()
                 if text and _RE_FIGURE_CAPTION.match(text):
                     _center_paragraph(para)
                     fig_count += 1
 
         tbl_count = 0
-        for table in doc.tables:
+        anchor_positions = _table_anchor_positions(doc)
+        for tbl_idx, table in enumerate(doc.tables):
+            if scope is not None and doc_tree is not None:
+                pos = anchor_positions[tbl_idx] if tbl_idx < len(anchor_positions) else -1
+                if pos < 0:
+                    continue
+                sec_type = doc_tree.get_section_for_paragraph(pos)
+                if not scope.is_section_enabled(sec_type):
+                    continue
             _center_table(table)
             tbl_count += 1
 
@@ -2602,8 +3184,18 @@ class SectionFormatRule(BaseRule):
                 paragraph_index=-1,
             )
 
-    def _enforce_reference_entries_no_indent(self, doc, doc_tree, tracker):
+    def _enforce_reference_entries_no_indent(
+        self,
+        doc,
+        doc_tree,
+        tracker,
+        *,
+        scope: FormatScopeConfig | None = None,
+    ):
         """Best-effort safety net for reference entries (even if section detection drifts)."""
+        if scope is not None and not scope.is_section_enabled("references"):
+            return
+
         start = None
         end = len(doc.paragraphs) - 1
 
@@ -2650,9 +3242,10 @@ class SectionFormatRule(BaseRule):
                 return
 
         count = 0
+        ref_sc = active_cfg.styles.get("references_body") if active_cfg is not None else None
         for i in range(max(0, start), min(len(doc.paragraphs) - 1, end) + 1):
             para = doc.paragraphs[i]
-            if _normalize_reference_entry_paragraph(para):
+            if _normalize_reference_entry_paragraph(para, style_config=ref_sc):
                 count += 1
 
         if count:
@@ -2661,8 +3254,8 @@ class SectionFormatRule(BaseRule):
                 target=f"{count} 条参考文献",
                 section="references",
                 change_type="format",
-                before="可能存在首行缩进/列表缩进",
-                after="左对齐且无缩进",
+                before="可能存在正文缩进/列表缩进蔓延",
+                after="按参考文献样式纠偏（含悬挂缩进）",
                 paragraph_index=-1,
             )
 
@@ -2793,9 +3386,10 @@ class SectionFormatRule(BaseRule):
                 continue
 
             para = doc.paragraphs[title_idx]
-            # Front-matter titles should keep heading semantics (outline level),
-            # but stay unnumbered and use scene-specific visual style.
-            self._make_para_unnumbered(doc, para)
+            # Keep abstract titles as unnumbered headings so native TOC can collect
+            # them, but TOC title itself must not become an outline-level heading.
+            if sec_type != "toc":
+                self._make_para_unnumbered(doc, para, apply_style=False)
             _lstrip_para_leading_space(para)
             self._format_paragraph(
                 para,
@@ -2812,8 +3406,8 @@ class SectionFormatRule(BaseRule):
                 target=f"{count} front titles",
                 section="global",
                 change_type="format",
-                before="scope disabled/mixed",
-                after="title fallback formatted",
+                before="无分节符/分页符",
+                after="下一节分节符",
                 paragraph_index=-1,
             )
 
@@ -2865,7 +3459,7 @@ class SectionFormatRule(BaseRule):
                 )
             if title_idx is None or title_idx <= 0:
                 continue
-            if not _has_nonempty_content(doc, title_idx + 1, len(doc.paragraphs) - 1):
+            if not _has_nonempty_body_content_after_paragraph(doc, title_idx):
                 continue
             boundaries.add(title_idx)
 
@@ -2917,8 +3511,8 @@ class SectionFormatRule(BaseRule):
                 target=f"{count} front titles",
                 section="global",
                 change_type="section_break",
-                before="鏃犲垎鑺傜/鍒嗛〉绗?",
-                after="涓嬩竴鑺傚垎鑺傜",
+                before="无分节符/分页符",
+                after="下一节分节符",
                 paragraph_index=-1,
             )
 
@@ -2965,7 +3559,9 @@ class SectionFormatRule(BaseRule):
 
             near_has_break = False
             for j in range(max(body_sec.start_index, i - 3), i):
-                if _para_has_sectpr(doc.paragraphs[j]):
+                if not _para_has_sectpr(doc.paragraphs[j]):
+                    continue
+                if _break_applies_to_boundary(doc, j, i):
                     near_has_break = True
                     break
             if near_has_break:
@@ -3015,13 +3611,31 @@ class SectionFormatRule(BaseRule):
         body_el = doc.element.body
         base_sectpr = body_el.find(f"{{{_W_NS}}}sectPr")
         boundaries: set[int] = set()
+        next_section_start_by_type: dict[int, int | None] = {}
+        ordered_sections = sorted(
+            getattr(doc_tree, "sections", []) or [],
+            key=lambda sec: int(getattr(sec, "start_index", 0)),
+        )
+        for idx, sec in enumerate(ordered_sections):
+            next_start = None
+            for later in ordered_sections[idx + 1:]:
+                later_start = int(getattr(later, "start_index", -1))
+                if later_start > int(getattr(sec, "start_index", -1)):
+                    next_start = later_start
+                    break
+            next_section_start_by_type[id(sec)] = next_start
 
         for sec in doc_tree.sections:
             if sec.section_type not in non_numbered_back_types:
                 continue
             if sec.start_index <= 0:
                 continue
-            if _has_nonempty_content(doc, sec.start_index + 1, sec.end_index):
+            next_start = next_section_start_by_type.get(id(sec))
+            if _has_nonempty_body_content_after_paragraph(
+                doc,
+                sec.start_index,
+                stop_before_para_idx=next_start,
+            ):
                 boundaries.add(sec.start_index)
 
         resume_sec = doc_tree.get_section("resume")
@@ -3030,7 +3644,7 @@ class SectionFormatRule(BaseRule):
             for i in range(resume_sec.start_index + 1, end + 1):
                 if not _para_is_resume_title(doc.paragraphs[i]):
                     continue
-                if _has_nonempty_content(doc, i + 1, len(doc.paragraphs) - 1):
+                if _has_nonempty_body_content_after_paragraph(doc, i):
                     boundaries.add(i)
 
         count = 0
@@ -3086,11 +3700,16 @@ class SectionFormatRule(BaseRule):
                 paragraph_index=-1,
             )
 
-    def _make_para_unnumbered(self, doc, para) -> None:
-        """Keep chapter-heading semantics but remove auto-number participation."""
-        heading_style = self._ensure_non_numbered_heading_style(doc)
-        if heading_style is not None:
-            para.style = heading_style
+    def _make_para_unnumbered(self, doc, para, *, apply_style: bool = True) -> None:
+        """Keep heading semantics but remove auto-number participation.
+
+        apply_style=False keeps the paragraph's existing style while still
+        marking it as an outline-level heading (used for 摘要/Abstract titles).
+        """
+        if apply_style:
+            heading_style = self._ensure_non_numbered_heading_style(doc)
+            if heading_style is not None:
+                para.style = heading_style
 
         ppr = para._element.find(f"{{{_W_NS}}}pPr")
         if ppr is None:
@@ -3120,6 +3739,12 @@ class SectionFormatRule(BaseRule):
         except KeyError:
             pass
 
+        pf = style.paragraph_format
+        pf.left_indent = Pt(0)
+        pf.first_line_indent = Pt(0)
+        pf.right_indent = Pt(0)
+        sync_indent_ooxml(style.element, force_zero=True)
+
         ppr = style.element.find(f"{{{_W_NS}}}pPr")
         if ppr is None:
             ppr = etree.SubElement(style.element, f"{{{_W_NS}}}pPr")
@@ -3143,7 +3768,7 @@ class SectionFormatRule(BaseRule):
     ):
         """Format one paragraph while preserving md_cleanup special blocks."""
         pf = para.paragraph_format
-        has_list = _para_has_num_pr(para)
+        has_list = _para_has_adjacent_list_marker(para)
         is_special = _para_is_special_block(para)
         if clear_indent_for_lists and not is_special:
             style_name = (para.style.name or "") if para.style else ""
@@ -3175,16 +3800,21 @@ class SectionFormatRule(BaseRule):
         pf.space_before = Pt(sc.space_before_pt)
         pf.space_after = Pt(sc.space_after_pt)
         apply_line_spacing(pf, sc.line_spacing_type, sc.line_spacing_pt)
+        sync_spacing_ooxml(
+            para._element,
+            space_before_pt=sc.space_before_pt,
+            space_after_pt=sc.space_after_pt,
+            line_spacing_type=sc.line_spacing_type,
+            line_spacing_value=sc.line_spacing_pt,
+        )
 
         if can_adjust_indent:
-            if sc.first_line_indent_chars > 0:
-                pf.first_line_indent = Pt(sc.size_pt * sc.first_line_indent_chars)
-                _sanitize_para_indent_ooxml(para, force_zero=False)
-            else:
-                pf.first_line_indent = Pt(0)
-                pf.left_indent = Pt(0)
-                pf.right_indent = Pt(0)
-                _sanitize_para_indent_ooxml(para, force_zero=True)
+            left_pt, first_pt, hanging_pt, right_pt = apply_style_config_indents(pf, para._element, sc)
+            _sanitize_para_indent_ooxml(
+                para,
+                force_zero=left_pt <= 0 and first_pt <= 0 and hanging_pt <= 0 and right_pt <= 0,
+                **style_config_indent_kwargs(sc),
+            )
 
         for run in para.runs:
             _apply_run_font(run, sc.font_cn, sc.font_en, sc.size_pt)

@@ -60,6 +60,14 @@ def sanitize_docx(src_path: str, aggressive: bool = False) -> str:
     return str(src)
 
 
+def docx_needs_sanitization(src_path: str, aggressive: bool = False) -> bool:
+    """Return whether the DOCX would be changed by ``sanitize_docx``."""
+    src = Path(src_path)
+    if not src.exists():
+        raise FileNotFoundError(f"File not found: {src}")
+    return _check_needs_fix(str(src)) or aggressive or _check_needs_aggressive_fix(str(src))
+
+
 def _check_needs_fix(path: str) -> bool:
     """Quick check for basic known issues."""
     try:

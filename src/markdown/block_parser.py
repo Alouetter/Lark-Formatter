@@ -1,7 +1,8 @@
 """块级 Markdown 解析器"""
 
 import re
-from src.markdown.ir import MarkdownBlock, BlockType
+import uuid
+from src.markdown.ir import MarkdownBlock, BlockType, InlineType
 from src.markdown.inline_parser import parse_inline
 
 # 块级正则
@@ -10,9 +11,13 @@ RE_FENCED_CODE = re.compile(r'^(`{3,}|~{3,})(\w*)\s*$')
 RE_BLOCKQUOTE = re.compile(r'^((?:>\s*)+)(.*)')
 RE_HR = re.compile(r'^(?:---+|\*\*\*+|___+)\s*$')
 RE_UNORDERED = re.compile(r'^(\s*)([-*+])\s+(.*)')
-RE_ORDERED = re.compile(r'^(\s*)(\d+\.)\s+(.*)')
+RE_ORDERED = re.compile(r'^(\s*)(\d+[.)])\s+(.*)')
+# 兼容中文/中式有序列表标记：1、 / (1) / （1）
+RE_ORDERED_CN_DUN = re.compile(r'^(\s*)(\d+、)\s*(.*)')
+RE_ORDERED_CN_PAREN = re.compile(r'^(\s*)([（(]\d+[)）])\s*(.*)')
 RE_TASK_LIST = re.compile(r'^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)')
 RE_LATEX_BLOCK = re.compile(r'^\$\$\s*$')
+RE_LATEX_BLOCK_INLINE = re.compile(r'^\$\$\s*(.+?)\s*\$\$$')
 RE_TABLE_ROW = re.compile(r'^\s*\|?.+\|.+\|?\s*$')
 RE_TABLE_SEP = re.compile(r'^\|[\s:]*-{3,}[\s:]*')
 RE_SOFT_BREAK = re.compile(r'  $')  # 行尾两个空格 = 硬换行
@@ -28,8 +33,8 @@ def _parse_table_row(text: str) -> list[str]:
         s = s[1:]
     if s.endswith('|') and not s.endswith('\\|'):
         s = s[:-1]
-    # 用占位符保护转义竖线
-    placeholder = '\x00PIPE\x00'
+    # 用唯一占位符保护转义竖线
+    placeholder = f"__PIPE_{uuid.uuid4().hex[:8]}__"
     s = s.replace('\\|', placeholder)
     cells = [c.strip().replace(placeholder, '|') for c in s.split('|')]
     return cells
@@ -71,9 +76,9 @@ def _table_col_count(text: str) -> int:
 
 
 def _has_inline_markdown(text: str) -> bool:
-    """启发式判断文本是否含行内 Markdown 语法"""
-    indicators = ['**', '~~', '`', '](', '<br', '![', '[^', '$']
-    return any(ind in text for ind in indicators)
+    """判断文本是否含可渲染的行内 Markdown 语法。"""
+    spans = parse_inline(text)
+    return any(span.type != InlineType.TEXT for span in spans)
 
 
 def _has_block_markdown(para_texts: list[tuple[int, str]]) -> bool:
@@ -82,14 +87,63 @@ def _has_block_markdown(para_texts: list[tuple[int, str]]) -> bool:
     用于区分"Markdown 粘贴"和"纯文本论文"：
     有块级语法 → 启用段落合并；无 → 跳过合并。
     """
-    for _, text in para_texts:
+    for i, (_, text) in enumerate(para_texts):
         s = text.strip()
         if not s:
             continue
-        if (RE_HEADING.match(s) or RE_FENCED_CODE.match(s)
+        if (
+                RE_HEADING.match(s) or RE_FENCED_CODE.match(s)
                 or RE_BLOCKQUOTE.match(s) or RE_HR.match(s)
-                or RE_TABLE_ROW.match(s) or RE_LATEX_BLOCK.match(s)):
+                or RE_LATEX_BLOCK.match(s) or RE_LATEX_BLOCK_INLINE.match(s)
+        ):
             return True
+        # 表格要满足“表头行 + 分隔行”才视为块级 Markdown，避免普通“含竖线文本”误判。
+        if RE_TABLE_ROW.match(s) and i + 1 < len(para_texts):
+            next_s = (para_texts[i + 1][1] or "").strip()
+            if next_s and _is_table_sep(next_s):
+                if _table_col_count(s) == _table_col_count(next_s):
+                    return True
+    return False
+
+
+def _match_ordered_item(text: str, *, allow_cn: bool = False):
+    """匹配有序列表项（支持可选中文标记）。"""
+    m = RE_ORDERED.match(text)
+    if m:
+        return m
+    if allow_cn:
+        m = RE_ORDERED_CN_DUN.match(text)
+        if m:
+            return m
+        m = RE_ORDERED_CN_PAREN.match(text)
+        if m:
+            return m
+    return None
+
+
+def _has_unambiguous_markdown_list_cluster(
+        para_texts: list[tuple[int, str]]) -> bool:
+    """是否存在连续的“强 Markdown 特征”列表行。
+
+    仅统计标准 Markdown 列表标记（-/*/+、1./1)、任务清单），
+    用于判断 docx 粘贴文本是否应开启列表转换。
+    """
+    consecutive = 0
+    for _, text in para_texts:
+        if not (text or "").strip():
+            consecutive = 0
+            continue
+        is_strong_list = bool(
+            RE_TASK_LIST.match(text)
+            or RE_UNORDERED.match(text)
+            or RE_ORDERED.match(text)
+        )
+        if is_strong_list:
+            consecutive += 1
+            if consecutive >= 2:
+                return True
+        else:
+            consecutive = 0
     return False
 
 
@@ -98,7 +152,7 @@ def _indent_to_level(indent: int) -> int:
     return min(indent // 2, 8)  # 每 2 空格一级，最多 8 级
 
 
-def _is_block_start(line: str) -> bool:
+def _is_block_start(line: str, *, allow_cn_ordered: bool = False) -> bool:
     """判断一行是否为块级元素的起始行"""
     s = line.strip()
     if not s:
@@ -113,11 +167,11 @@ def _is_block_start(line: str) -> bool:
         return True
     if RE_TASK_LIST.match(s):
         return True
-    if RE_UNORDERED.match(s) or RE_ORDERED.match(s):
+    if RE_UNORDERED.match(s) or _match_ordered_item(s, allow_cn=allow_cn_ordered):
         return True
     if RE_TABLE_ROW.match(s):
         return True
-    if RE_LATEX_BLOCK.match(s):
+    if RE_LATEX_BLOCK.match(s) or RE_LATEX_BLOCK_INLINE.match(s):
         return True
     if RE_FOOTNOTE_DEF.match(s):
         return True
@@ -179,19 +233,31 @@ def parse_markdown_text(text: str) -> list[MarkdownBlock]:
             lang = m.group(2) or ""
             code_lines = []
             j = i + 1
+            closed = False
             while j < len(lines):
                 if lines[j].rstrip().startswith(fence[0] * len(fence)):
+                    closed = True
                     break
                 code_lines.append(lines[j])
                 j += 1
+            if closed:
+                blocks.append(MarkdownBlock(
+                    type=BlockType.CODE_BLOCK, language=lang,
+                    code_lines=code_lines,
+                    raw_text='\n'.join(code_lines)))
+                i = j + 1
+                continue
+
+        # LaTeX 块（单行或围栏）
+        m_inline = RE_LATEX_BLOCK_INLINE.match(stripped)
+        if m_inline:
             blocks.append(MarkdownBlock(
-                type=BlockType.CODE_BLOCK, language=lang,
-                code_lines=code_lines,
-                raw_text='\n'.join(code_lines)))
-            i = j + 1
+                type=BlockType.LATEX_BLOCK,
+                raw_text=m_inline.group(1).strip()))
+            i += 1
             continue
 
-        # LaTeX 块 $$
+        # LaTeX 围栏块 $$
         if RE_LATEX_BLOCK.match(stripped):
             latex_lines = []
             j = i + 1
@@ -223,14 +289,13 @@ def parse_markdown_text(text: str) -> list[MarkdownBlock]:
                         break
                     rows.append(row_cells)
                     j += 1
-                if rows:
-                    blocks.append(MarkdownBlock(
-                        type=BlockType.TABLE,
-                        table_headers=headers,
-                        table_alignments=aligns,
-                        table_rows=rows))
-                    i = j
-                    continue
+                blocks.append(MarkdownBlock(
+                    type=BlockType.TABLE,
+                    table_headers=headers,
+                    table_alignments=aligns,
+                    table_rows=rows))
+                i = j
+                continue
 
         # 标题
         m = RE_HEADING.match(stripped)
@@ -301,8 +366,9 @@ def parse_markdown_text(text: str) -> list[MarkdownBlock]:
             i += 1
             continue
 
-        # 列表项
-        m = RE_UNORDERED.match(stripped) or RE_ORDERED.match(stripped)
+        # 列表项（支持中文/中式有序标记）
+        m = RE_UNORDERED.match(stripped) or _match_ordered_item(
+            stripped, allow_cn=True)
         if m:
             indent = len(m.group(1))
             marker = m.group(2)
@@ -326,7 +392,7 @@ def parse_markdown_text(text: str) -> list[MarkdownBlock]:
             if not next_line:
                 break
             # 如果下一行是块级元素，停止合并
-            if _is_block_start(next_line):
+            if _is_block_start(next_line, allow_cn_ordered=True):
                 break
             para_lines.append(next_line_raw)
             j += 1
@@ -345,7 +411,9 @@ def parse_markdown_text(text: str) -> list[MarkdownBlock]:
 # ── 粘贴修复模式：解析 DOCX 段落文本 ──
 
 def parse_docx_paragraphs(
-        para_texts: list[tuple[int, str]]) -> list[MarkdownBlock]:
+        para_texts: list[tuple[int, str]],
+        *,
+        markdown_paste_hint: bool = False) -> list[MarkdownBlock]:
     """解析 DOCX 段落文本为 MarkdownBlock 列表。
 
     输入: [(段落索引, 段落文本), ...]
@@ -357,16 +425,19 @@ def parse_docx_paragraphs(
     # 预扫描：有块级 Markdown 语法时才启用段落合并
     # （区分"Markdown 粘贴"和"纯文本论文"）
     merge_enabled = _has_block_markdown(para_texts)
+    # 列表转换仅在“疑似 Markdown 粘贴”语境下启用，减少误伤原生文档结构。
+    list_mode_enabled = bool(markdown_paste_hint) or merge_enabled or _has_unambiguous_markdown_list_cluster(para_texts)
 
     while i < len(para_texts):
         para_idx, text = para_texts[i]
         stripped = text.strip()
 
-        # 空段落 → 发射 BLANK 块（供 md_cleanup 删除）
+        # 空段落只在疑似 Markdown 粘贴语境下发射 BLANK，避免误删普通正文留白。
         if not stripped:
-            blocks.append(MarkdownBlock(
-                type=BlockType.BLANK,
-                source_para_indices=[para_idx]))
+            if markdown_paste_hint or merge_enabled or list_mode_enabled:
+                blocks.append(MarkdownBlock(
+                    type=BlockType.BLANK,
+                    source_para_indices=[para_idx]))
             i += 1
             continue
 
@@ -378,20 +449,54 @@ def parse_docx_paragraphs(
             code_lines = []
             indices = [para_idx]
             j = i + 1
+            closed = False
             while j < len(para_texts):
                 j_idx, j_text = para_texts[j]
                 indices.append(j_idx)
                 if j_text.strip().startswith(fence[0] * len(fence)):
+                    closed = True
                     break
                 code_lines.append(j_text)
                 j += 1
+            if closed:
+                blocks.append(MarkdownBlock(
+                    type=BlockType.CODE_BLOCK, language=lang,
+                    code_lines=code_lines,
+                    raw_text='\n'.join(code_lines),
+                    source_para_indices=indices))
+                i = j + 1
+                continue
+
+        # LaTeX 块（单段或围栏）
+        m_inline = RE_LATEX_BLOCK_INLINE.match(stripped)
+        if m_inline:
             blocks.append(MarkdownBlock(
-                type=BlockType.CODE_BLOCK, language=lang,
-                code_lines=code_lines,
-                raw_text='\n'.join(code_lines),
-                source_para_indices=indices))
-            i = j + 1
+                type=BlockType.LATEX_BLOCK,
+                raw_text=m_inline.group(1).strip(),
+                source_para_indices=[para_idx]))
+            i += 1
             continue
+
+        if RE_LATEX_BLOCK.match(stripped):
+            latex_lines = []
+            indices = [para_idx]
+            j = i + 1
+            closed = False
+            while j < len(para_texts):
+                j_idx, j_text = para_texts[j]
+                indices.append(j_idx)
+                if RE_LATEX_BLOCK.match(j_text.strip()):
+                    closed = True
+                    break
+                latex_lines.append(j_text)
+                j += 1
+            if closed:
+                blocks.append(MarkdownBlock(
+                    type=BlockType.LATEX_BLOCK,
+                    raw_text='\n'.join(latex_lines).strip(),
+                    source_para_indices=indices))
+                i = j + 1
+                continue
 
         # 表格（多段落）
         if RE_TABLE_ROW.match(stripped):
@@ -415,16 +520,15 @@ def parse_docx_paragraphs(
                 aligns = _parse_alignment(texts[1])
                 if len(headers) >= 2 and len(aligns) == len(headers):
                     rows = [_parse_table_row(t) for t in texts[2:]]
-                    if rows:
-                        indices = [idx for idx, _ in table_items]
-                        blocks.append(MarkdownBlock(
-                            type=BlockType.TABLE,
-                            table_headers=headers,
-                            table_alignments=aligns,
-                            table_rows=rows,
-                            source_para_indices=indices))
-                        i = j
-                        continue
+                    indices = [idx for idx, _ in table_items]
+                    blocks.append(MarkdownBlock(
+                        type=BlockType.TABLE,
+                        table_headers=headers,
+                        table_alignments=aligns,
+                        table_rows=rows,
+                        source_para_indices=indices))
+                    i = j
+                    continue
 
         # 标题
         m = RE_HEADING.match(stripped)
@@ -490,7 +594,7 @@ def parse_docx_paragraphs(
 
         # 任务清单 - [x] / - [ ]（用 text 保留前导空格以检测缩进）
         tm = RE_TASK_LIST.match(text)
-        if tm:
+        if tm and list_mode_enabled:
             indent = len(tm.group(1))
             checked = tm.group(2).lower() == 'x'
             content = tm.group(3)
@@ -504,9 +608,12 @@ def parse_docx_paragraphs(
             i += 1
             continue
 
-        # 列表项（用 text 保留前导空格以检测嵌套层级）
-        m = RE_UNORDERED.match(text) or RE_ORDERED.match(text)
-        if m:
+        # 列表项（仅在疑似 Markdown 语境启用，避免误改原生论文编号结构）
+        m = None
+        if list_mode_enabled:
+            m = RE_UNORDERED.match(text) or _match_ordered_item(
+                text, allow_cn=list_mode_enabled)
+        if m is not None:
             indent = len(m.group(1))
             marker = m.group(2)
             content = m.group(3)
@@ -520,8 +627,8 @@ def parse_docx_paragraphs(
             i += 1
             continue
 
-        # 无行内 Markdown 且非合并模式 → 跳过
-        if not _has_inline_markdown(stripped) and not merge_enabled:
+        # 无行内 Markdown → 跳过（避免误改普通正文段落）
+        if not _has_inline_markdown(stripped):
             i += 1
             continue
 
@@ -536,7 +643,10 @@ def parse_docx_paragraphs(
                 j_stripped = j_text.strip()
                 if not j_stripped:
                     break
-                if _is_block_start(j_stripped):
+                if _is_block_start(
+                        j_stripped, allow_cn_ordered=list_mode_enabled):
+                    break
+                if not _has_inline_markdown(j_stripped):
                     break
                 para_lines.append(j_stripped)
                 merge_indices.append(j_idx)

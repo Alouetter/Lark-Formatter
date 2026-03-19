@@ -5,10 +5,13 @@ from docx.shared import Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.style import WD_STYLE_TYPE
 from src.engine.rules.base import BaseRule
+from src.engine.rules.table_format import top_level_table_anchor_positions
 from src.engine.change_tracker import ChangeTracker
 from src.scene.schema import SceneConfig, StyleConfig
 from src.scene.heading_model import get_level_to_style_key, get_level_to_word_style
-from src.utils.line_spacing import apply_line_spacing
+from src.utils.indent import apply_style_config_indents
+from src.utils.line_spacing import apply_line_spacing, sync_spacing_ooxml
+from src.utils.ooxml import apply_explicit_rfonts
 
 ALIGNMENT_MAP = {
     "left": WD_ALIGN_PARAGRAPH.LEFT,
@@ -19,7 +22,7 @@ ALIGNMENT_MAP = {
 
 # 不全局修改的样式（由 section_format / toc_format / page_setup 按段落直接应用）
 SKIP_GLOBAL_STYLES = {
-    "normal", "references_body", "acknowledgment_body",
+    "references_body", "acknowledgment_body",
     "abstract_body", "abstract_body_en",
     "abstract_title_cn", "abstract_title_en",
     "appendix_body", "resume_body", "symbol_table_body",
@@ -27,22 +30,95 @@ SKIP_GLOBAL_STYLES = {
     "header_cn", "header_en", "page_number",
 }
 
+SPECIAL_WORD_STYLE_NAMES = {
+    "normal": "Normal",
+}
+
+
+def _iter_cover_paragraphs(doc: Document, context: dict):
+    doc_tree = context.get("doc_tree") if isinstance(context, dict) else None
+    if doc_tree is None:
+        return
+
+    cover = doc_tree.get_section("cover")
+    if cover is None:
+        return
+
+    for idx in cover.paragraph_range:
+        if 0 <= idx < len(doc.paragraphs):
+            yield doc.paragraphs[idx]
+
+    anchor_positions = top_level_table_anchor_positions(doc)
+    seen_cells: set[int] = set()
+    for tbl_idx, table in enumerate(doc.tables):
+        pos = anchor_positions[tbl_idx] if tbl_idx < len(anchor_positions) else -1
+        if pos < 0:
+            continue
+        try:
+            sec_type = doc_tree.get_section_for_paragraph(pos)
+        except Exception:
+            sec_type = None
+        if sec_type != "cover":
+            continue
+        for row in table.rows:
+            for cell in row.cells:
+                cell_id = id(cell._tc)
+                if cell_id in seen_cells:
+                    continue
+                seen_cells.add(cell_id)
+                for para in cell.paragraphs:
+                    yield para
+
+
+def _style_lineage_names(style) -> set[str]:
+    names: set[str] = set()
+    current = style
+    safety = 0
+    while current is not None and safety < 32:
+        safety += 1
+        name = str(getattr(current, "name", "") or "").strip()
+        if name:
+            names.add(name)
+        current = getattr(current, "base_style", None)
+    return names
+
+
+def _collect_cover_used_style_names(doc: Document, context: dict) -> set[str]:
+    protected: set[str] = set()
+    for para in _iter_cover_paragraphs(doc, context) or []:
+        protected.update(_style_lineage_names(getattr(para, "style", None)))
+    return protected
+
 
 def _apply_style_config(style, sc: StyleConfig) -> None:
     """将 StyleConfig 应用到 Word 样式对象"""
     from lxml import etree
     W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 
+    def _set_on_off_rpr(tag: str, enabled: bool) -> None:
+        old = rpr.find(f'{W}{tag}')
+        if old is not None:
+            rpr.remove(old)
+        el = etree.SubElement(rpr, f'{W}{tag}')
+        if not enabled:
+            el.set(f'{W}val', '0')
+
     font = style.font
     font.name = sc.font_en
     font.size = Pt(sc.size_pt)
-    font.bold = sc.bold if sc.bold else None
-    font.italic = sc.italic if sc.italic else None
+    # 显式控制粗斜体，避免内置样式残留的 bCs/iCs 继续生效。
+    font.bold = None
+    font.italic = None
 
     # 中文字体 + 清除主题字体/颜色引用
     rpr = style.element.find(f'{W}rPr')
     if rpr is None:
         rpr = etree.SubElement(style.element, f'{W}rPr')
+
+    _set_on_off_rpr('b', bool(sc.bold))
+    _set_on_off_rpr('bCs', bool(sc.bold))
+    _set_on_off_rpr('i', bool(sc.italic))
+    _set_on_off_rpr('iCs', bool(sc.italic))
 
     # 强制黑色字体，清除文档主题色（如蓝色 accent1）
     color_el = rpr.find(f'{W}color')
@@ -53,6 +129,11 @@ def _apply_style_config(style, sc: StyleConfig) -> None:
     rfonts = rpr.find(f'{W}rFonts')
     if rfonts is None:
         rfonts = etree.SubElement(rpr, f'{W}rFonts')
+    apply_explicit_rfonts(
+        rpr,
+        font_cn=sc.font_cn,
+        font_en=sc.font_en,
+    )
     # 设置显式字体
     rfonts.set(f'{W}eastAsia', sc.font_cn)
     rfonts.set(f'{W}ascii', sc.font_en)
@@ -76,9 +157,15 @@ def _apply_style_config(style, sc: StyleConfig) -> None:
     pf.space_after = Pt(sc.space_after_pt)
 
     apply_line_spacing(pf, sc.line_spacing_type, sc.line_spacing_pt)
+    sync_spacing_ooxml(
+        style.element,
+        space_before_pt=sc.space_before_pt,
+        space_after_pt=sc.space_after_pt,
+        line_spacing_type=sc.line_spacing_type,
+        line_spacing_value=sc.line_spacing_pt,
+    )
 
-    if sc.first_line_indent_chars > 0:
-        pf.first_line_indent = Pt(sc.size_pt * sc.first_line_indent_chars)
+    apply_style_config_indents(pf, style.element, sc)
 
 
 class StyleManagerRule(BaseRule):
@@ -87,6 +174,16 @@ class StyleManagerRule(BaseRule):
 
     def apply(self, doc: Document, config: SceneConfig,
               tracker: ChangeTracker, context: dict) -> None:
+        protected_word_styles: set[str] = set()
+        scope = context.get("format_scope") if isinstance(context, dict) else None
+        if scope is not None and hasattr(scope, "is_section_enabled"):
+            try:
+                cover_enabled = bool(scope.is_section_enabled("cover"))
+            except Exception:
+                cover_enabled = True
+            if not cover_enabled:
+                protected_word_styles.update(_collect_cover_used_style_names(doc, context))
+
         style_name_map = {}
         level_style_key_map = get_level_to_style_key(config)
         level_word_style_map = get_level_to_word_style(config)
@@ -100,7 +197,12 @@ class StyleManagerRule(BaseRule):
             if style_key in SKIP_GLOBAL_STYLES:
                 continue
 
-            word_name = style_name_map.get(style_key, style_key)
+            word_name = SPECIAL_WORD_STYLE_NAMES.get(
+                style_key,
+                style_name_map.get(style_key, style_key),
+            )
+            if word_name in protected_word_styles:
+                continue
             try:
                 style = doc.styles[word_name]
             except KeyError:
@@ -118,3 +220,4 @@ class StyleManagerRule(BaseRule):
                 after=f"font={sc.font_cn}/{sc.font_en} {sc.size_pt}pt",
                 paragraph_index=-1,
             )
+

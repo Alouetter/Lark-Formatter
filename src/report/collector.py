@@ -14,6 +14,9 @@ class ReportData:
     changes_by_rule: dict = field(default_factory=dict)
     validation_issues: list = field(default_factory=list)
     summary: dict = field(default_factory=dict)
+    formula_stats: dict = field(default_factory=dict)
+    low_confidence_items: list = field(default_factory=list)
+    formula_diagnostics: list = field(default_factory=list)
 
 
 def collect_report(tracker: ChangeTracker,
@@ -51,4 +54,32 @@ def collect_report(tracker: ChangeTracker,
         for v in (validation_issues or [])
     ]
     report.summary = tracker.summary()
+
+    formula_rules = {"formula_convert", "formula_to_table", "equation_table_format", "formula_style"}
+    formula_stats: dict[str, str] = {}
+    low_confidence_items: list[dict] = []
+    formula_diagnostics: list[dict] = []
+    for rec in tracker.records:
+        if rec.rule_name in formula_rules and rec.target == "summary":
+            formula_stats[rec.rule_name] = rec.after or ""
+        if rec.rule_name in formula_rules and rec.change_type == "skip" and "低置信" in (rec.after or ""):
+            low_confidence_items.append({
+                "rule": rec.rule_name,
+                "target": rec.target,
+                "section": rec.section,
+                "paragraph_index": rec.paragraph_index,
+                "reason": rec.after,
+                "suggestion": "建议人工复核该公式后再处理",
+            })
+        if rec.rule_name in formula_rules and rec.change_type == "diagnostic":
+            formula_diagnostics.append({
+                "rule": rec.rule_name,
+                "target": rec.target,
+                "section": rec.section,
+                "paragraph_index": rec.paragraph_index,
+                "reason": rec.after,
+            })
+    report.formula_stats = formula_stats
+    report.low_confidence_items = low_confidence_items
+    report.formula_diagnostics = formula_diagnostics
     return report

@@ -13,6 +13,7 @@ crash.log
 # Build outputs
 build/
 dist/
+templates/
 
 # Local IDE/agent metadata
 .claude/
@@ -20,8 +21,42 @@ dist/
 # Generated manual test artifacts
 tmp_repro/
 tmp_*.docx
+_tmp_*.docx
 test*.docx
+
+# Local-only validation artifacts (keep locally, do not upload)
+e2e_*/
+exec-clone-check-*/
+scan_reports/
+scene-upgrade-check-*/
+tmp_md_audit/
+tmp_md_symbol_audit/
+tmp_toc_probe*/
+tests/00/
+tests/clone/
+tests/former-templates/
+tests/test-1/
+tests/test-equation/
+tests/test-markdown/
+tests/_tmp_*
+tests/_clone_*/
+tests/_scene_prompt_regression_*/
+tests/lf_*/
+tests/目录/
 *_排版附件/
 提示词模板/
 *_risk_100.txt
 参考文献*.docx
+copytest-*.docx
+*_new.docx
+*_???.docx
+*_??.json
+*_??.md
+tmp_prompt_regression_exec_*/
+prompt_filled.txt
+spec_extracted.txt
+summary.json
+summary.md
+round_*.json
+round_*.log
+round_*_last_message.txt

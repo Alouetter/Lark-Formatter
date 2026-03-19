@@ -74,6 +74,7 @@ _RE_REFERENCE_ENTRY = [
     re.compile(r"^\s*[（(]\d{1,4}[）)]\s*\S"),  # (1) ...
     re.compile(r"^\s*\d{1,4}\.\s+\S"),          # 1. ...
 ]
+_REFERENCE_ENTRY_CLUSTER_MAX_LEN = 240
 
 _FRONT_TITLE_NORMS = {
     "\u6458\u8981",
@@ -118,6 +119,15 @@ class _Candidate:
 
 def _is_reference_entry_text(text: str) -> bool:
     return looks_like_reference_entry_line(text)
+
+
+def _is_reference_entry_content_text(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if len(raw) > _REFERENCE_ENTRY_CLUSTER_MAX_LEN:
+        return False
+    return _is_reference_entry_text(raw)
 
 
 def _norm_no_space_lower(text: str) -> str:
@@ -691,14 +701,28 @@ class DocTree:
             return None
 
         recovered = self._scan_body_start_range(start, end)
+        recovered_by_cluster = False
         if recovered is None:
             recovered = self._scan_stable_body_cluster(start, end)
+            recovered_by_cluster = recovered is not None
+            if recovered is not None and recovered <= last_pre.start_index:
+                recovered = None
+                recovered_by_cluster = False
         if recovered is None and end < total:
             # last_pre end may already be over-extended; allow full-tail scan once.
             recovered = self._scan_body_start_range(start, total)
             if recovered is None:
                 recovered = self._scan_stable_body_cluster(start, total)
+                recovered_by_cluster = recovered is not None
+                if recovered is not None and recovered <= last_pre.start_index:
+                    recovered = None
+                    recovered_by_cluster = False
         if recovered is None:
+            return None
+
+        if recovered_by_cluster and last_pre.section_type in {"abstract_cn", "abstract_en"}:
+            # Abstract bodies are narrative prose by design; without a stronger
+            # heading/body-start signal, do not reclassify them as正文.
             return None
 
         text = (self._doc_ref.paragraphs[recovered].text or "").strip() if self._doc_ref else ""
@@ -723,7 +747,7 @@ class DocTree:
 
         for i in range(start, total):
             text = (doc.paragraphs[i].text or "").strip()
-            if not _is_reference_entry_text(text):
+            if not _is_reference_entry_content_text(text):
                 continue
 
             # 观察后续窗口内是否形成“连续参考条目簇”
@@ -735,7 +759,7 @@ class DocTree:
                 if not t:
                     continue
                 nonempty_count += 1
-                if _is_reference_entry_text(t):
+                if _is_reference_entry_content_text(t):
                     ref_count += 1
 
             if ref_count < 2:

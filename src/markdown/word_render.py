@@ -1,6 +1,9 @@
 """共享 Word 渲染工具函数：Markdown IR → Word OOXML"""
 
 import os
+import logging
+import re
+import unicodedata
 from pathlib import Path
 from lxml import etree
 from docx import Document
@@ -10,10 +13,16 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from src.markdown.ir import InlineSpan, InlineType
 from src.markdown.inline_parser import parse_inline
+from src.utils.line_spacing import apply_safe_picture_line_spacing
+
+logger = logging.getLogger(__name__)
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+
+# 缓存编号 ID，避免重复遍历
+_numbering_id_cache = {}
 
 
 def _w(tag: str) -> str:
@@ -97,7 +106,87 @@ _DECIMAL_FMTS = [
 ]
 
 
-def register_list_numbering(doc, list_type: str = "bullet") -> int:
+def normalize_ordered_list_style(style: str | None) -> str:
+    raw = str(style or "").strip().lower()
+    aliases = {
+        "legacy": "mixed",
+        "legacy_mixed": "mixed",
+        "default": "mixed",
+        "dot": "decimal_dot",
+        "paren_right": "decimal_paren_right",
+        "cn_dun": "decimal_cn_dun",
+        "full_paren": "decimal_full_paren",
+    }
+    raw = aliases.get(raw, raw)
+    if raw in {
+        "mixed",
+        "decimal_dot",
+        "decimal_paren_right",
+        "decimal_cn_dun",
+        "decimal_full_paren",
+    }:
+        return raw
+    return "mixed"
+
+
+def normalize_unordered_list_style(style: str | None) -> str:
+    raw = str(style or "").strip().lower()
+    aliases = {
+        "legacy": "word_default",
+        "default": "word_default",
+        "dot": "bullet_dot",
+        "circle": "bullet_circle",
+        "square": "bullet_square",
+        "dash": "bullet_dash",
+    }
+    raw = aliases.get(raw, raw)
+    if raw in {
+        "word_default",
+        "bullet_dot",
+        "bullet_circle",
+        "bullet_square",
+        "bullet_dash",
+    }:
+        return raw
+    return "word_default"
+
+
+def get_ordered_level_format(style: str | None, ilvl: int) -> tuple[str, str]:
+    ilvl = max(0, min(int(ilvl), 8))
+    style_key = normalize_ordered_list_style(style)
+    token = f"%{ilvl + 1}"
+    if style_key == "decimal_dot":
+        return "decimal", f"{token}."
+    if style_key == "decimal_paren_right":
+        return "decimal", f"{token})"
+    if style_key == "decimal_cn_dun":
+        return "decimal", f"{token}、"
+    if style_key == "decimal_full_paren":
+        return "decimal", f"（{token}）"
+    return _DECIMAL_FMTS[ilvl]
+
+
+def get_unordered_level_definition(style: str | None, ilvl: int) -> tuple[str, str, str]:
+    ilvl = max(0, min(int(ilvl), 8))
+    style_key = normalize_unordered_list_style(style)
+    if style_key == "bullet_dot":
+        return "•", "Times New Roman", "Times New Roman"
+    if style_key == "bullet_circle":
+        return "○", "宋体", "宋体"
+    if style_key == "bullet_square":
+        return "■", "宋体", "宋体"
+    if style_key == "bullet_dash":
+        return "-", "Times New Roman", "Times New Roman"
+    return _BULLET_DEFS[ilvl]
+
+
+def register_list_numbering(
+        doc,
+        list_type: str = "bullet",
+        *,
+        marker_separator: str = "tab",
+        ordered_style: str = "mixed",
+        unordered_style: str = "word_default") -> int:
     """注册 9 级多级列表编号定义，返回 numId。
 
     list_type: "bullet" 或 "decimal"
@@ -107,6 +196,17 @@ def register_list_numbering(doc, list_type: str = "bullet") -> int:
 
     abs_id = _next_num_id(numbering_el, "abstractNum", "abstractNumId")
     num_id = _next_num_id(numbering_el, "num", "numId")
+
+    sep_key = str(marker_separator or "tab").strip().lower()
+    if sep_key in {"half_space", "space", "halfwidth_space"}:
+        suff_val = "space"
+    elif sep_key in {"full_space", "fullwidth_space"}:
+        # Word 编号后缀不支持全角空格，使用 nothing 并由调用方补入 U+3000。
+        suff_val = "nothing"
+    else:
+        suff_val = "tab"
+    ordered_style = normalize_ordered_list_style(ordered_style)
+    unordered_style = normalize_unordered_list_style(unordered_style)
 
     # 构建 abstractNum
     abs_num = etree.SubElement(numbering_el, _w("abstractNum"))
@@ -122,13 +222,17 @@ def register_list_numbering(doc, list_type: str = "bullet") -> int:
         start.set(_w("val"), "1")
 
         if list_type == "bullet":
-            bullet_char, _, _ = _BULLET_DEFS[ilvl]
+            bullet_char, ascii_font, hansi_font = get_unordered_level_definition(
+                unordered_style, ilvl
+            )
             fmt = etree.SubElement(lvl, _w("numFmt"))
             fmt.set(_w("val"), "bullet")
             txt = etree.SubElement(lvl, _w("lvlText"))
             txt.set(_w("val"), bullet_char)
         else:
-            num_fmt_val, lvl_text_val = _DECIMAL_FMTS[ilvl]
+            num_fmt_val, lvl_text_val = get_ordered_level_format(
+                ordered_style, ilvl
+            )
             fmt = etree.SubElement(lvl, _w("numFmt"))
             fmt.set(_w("val"), num_fmt_val)
             txt = etree.SubElement(lvl, _w("lvlText"))
@@ -137,9 +241,9 @@ def register_list_numbering(doc, list_type: str = "bullet") -> int:
         jc = etree.SubElement(lvl, _w("lvlJc"))
         jc.set(_w("val"), "left")
 
-        # tab 分隔符
+        # 列表序号后缀分隔符（tab / space / nothing）
         suff = etree.SubElement(lvl, _w("suff"))
-        suff.set(_w("val"), "tab")
+        suff.set(_w("val"), suff_val)
 
         # 缩进：每层增加 0.75cm
         ppr = etree.SubElement(lvl, _w("pPr"))
@@ -153,7 +257,6 @@ def register_list_numbering(doc, list_type: str = "bullet") -> int:
         rpr = etree.SubElement(lvl, _w("rPr"))
         rfonts = etree.SubElement(rpr, _w("rFonts"))
         if list_type == "bullet":
-            _, ascii_font, hansi_font = _BULLET_DEFS[ilvl]
             rfonts.set(_w("ascii"), ascii_font)
             rfonts.set(_w("hAnsi"), hansi_font)
             rfonts.set(_w("hint"), "default")
@@ -175,13 +278,21 @@ def register_list_numbering(doc, list_type: str = "bullet") -> int:
 
 
 def _next_num_id(numbering_el, tag: str, attr: str) -> int:
-    """获取下一个可用的编号 ID"""
+    """获取下一个可用的编号 ID（使用缓存优化性能）"""
+    cache_key = (id(numbering_el), tag, attr)
+
     max_id = 0
     for el in numbering_el.findall(_w(tag)):
         val = el.get(_w(attr))
         if val and val.isdigit():
             max_id = max(max_id, int(val))
-    return max_id + 1
+
+    # `id(numbering_el)` may be reused by another Document, so stale cache
+    # entries must not allocate an ID below the real max in the current file.
+    cached_max = int(_numbering_id_cache.get(cache_key, 0) or 0)
+    next_id = max(max_id, cached_max) + 1
+    _numbering_id_cache[cache_key] = next_id
+    return next_id
 
 
 def apply_num_pr(para, num_id: int, ilvl: int) -> None:
@@ -236,7 +347,9 @@ def write_spans(para, spans: list[InlineSpan], *,
                 base_font_size=None,
                 doc=None,
                 footnote_defs: dict[str, str] | None = None,
-                clear_existing: bool = True) -> None:
+                clear_existing: bool = True,
+                image_base_path: str | None = None,
+                prefer_real_image: bool = False) -> None:
     """将 InlineSpan 列表渲染为段落 runs。
 
     支持所有行内类型：TEXT, BOLD, ITALIC, CODE, HYPERLINK,
@@ -263,9 +376,17 @@ def write_spans(para, spans: list[InlineSpan], *,
             continue
 
         if span.type == InlineType.IMAGE:
-            # 图片由 insert_image 处理，这里回退为斜体文本
+            if prefer_real_image:
+                inserted = insert_image(
+                    para, span.text, span.url, base_path=image_base_path
+                )
+                if inserted:
+                    continue
+            # 回退：斜体占位文本
             run = para.add_run(f"[{span.text}]")
             run.italic = True
+            if base_font_name:
+                run.font.name = base_font_name
             if base_font_size:
                 run.font.size = base_font_size
             continue
@@ -278,8 +399,13 @@ def write_spans(para, spans: list[InlineSpan], *,
                     try:
                         add_footnote(doc, para, fn_id, content)
                         continue
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"Failed to add footnote {fn_id}: {e}")
+                        # 在文档中标记失败
+                        run = para.add_run(f"[脚注{fn_id}]")
+                        run.font.color.rgb = RGBColor(255, 0, 0)
+                        run.font.superscript = True
+                        continue
 
             run = para.add_run(fn_id or span.text or "")
             run.font.superscript = True
@@ -318,7 +444,289 @@ def _apply_inline_format(run, span: InlineSpan) -> None:
 
 # ── 表格单元格渲染 ──
 
-def write_table_cell(cell, text: str) -> None:
+_RE_BR_SPLIT = re.compile(r"<br\s*/?\s*>", re.IGNORECASE)
+
+
+def _display_text_width(text: str) -> int:
+    """Estimate visual width for markdown table column distribution."""
+    raw = _RE_BR_SPLIT.sub("\n", str(text or ""))
+    lines = raw.splitlines() or [raw]
+    best = 1
+    for line in lines:
+        width = 0
+        for ch in line.strip():
+            if ch == "\t":
+                width += 2
+            elif unicodedata.east_asian_width(ch) in {"F", "W"}:
+                width += 2
+            else:
+                width += 1
+        best = max(best, width)
+    return best
+
+
+def _available_page_width_twips(doc) -> int:
+    emu_per_twip = 635
+    try:
+        section = doc.sections[0]
+        page_w = int(section.page_width or 0) // emu_per_twip
+        left = int(section.left_margin or 0) // emu_per_twip
+        right = int(section.right_margin or 0) // emu_per_twip
+        avail = page_w - left - right
+        if avail > 0:
+            return avail
+    except Exception:
+        pass
+    return 9000
+
+
+def _table_col_widths(headers: list[str], rows: list[list[str]], total_twips: int) -> list[int]:
+    col_count = len(headers)
+    if col_count <= 0:
+        return []
+    if col_count == 1:
+        return [max(1440, total_twips)]
+
+    weights = [max(2.0, float(_display_text_width(h) + 2)) for h in headers]
+    for row in rows:
+        for idx in range(min(col_count, len(row))):
+            weights[idx] = max(weights[idx], float(_display_text_width(row[idx]) + 2))
+
+    sorted_weights = sorted(weights)
+    median = sorted_weights[len(sorted_weights) // 2]
+    cap = max(12.0, median * 3.0)
+    weights = [min(w, cap) for w in weights]
+
+    min_col = 640
+    min_total = min_col * col_count
+    if total_twips <= min_total:
+        base = total_twips // col_count
+        widths = [base] * col_count
+        widths[0] += total_twips - sum(widths)
+        return widths
+
+    extra = total_twips - min_total
+    weight_sum = sum(weights) or float(col_count)
+    widths = [min_col + int(extra * (w / weight_sum)) for w in weights]
+    widths[0] += total_twips - sum(widths)
+    return widths
+
+
+def _set_native_table_style(tbl_el) -> None:
+    tbl_pr = tbl_el.find(_w("tblPr"))
+    if tbl_pr is None:
+        tbl_pr = etree.SubElement(tbl_el, _w("tblPr"))
+        tbl_el.insert(0, tbl_pr)
+    tbl_style = tbl_pr.find(_w("tblStyle"))
+    if tbl_style is not None:
+        tbl_pr.remove(tbl_style)
+    tbl_look = tbl_pr.find(_w("tblLook"))
+    if tbl_look is not None:
+        tbl_pr.remove(tbl_look)
+
+
+def _clear_table_cell_spacing(tbl_el) -> None:
+    tbl_pr = tbl_el.find(_w("tblPr"))
+    if tbl_pr is not None:
+        tbl_cell_spacing = tbl_pr.find(_w("tblCellSpacing"))
+        if tbl_cell_spacing is not None:
+            tbl_pr.remove(tbl_cell_spacing)
+
+    # Some pasted Markdown tables store cell spacing at row level.
+    for tr in tbl_el.findall(_w("tr")):
+        tr_pr = tr.find(_w("trPr"))
+        if tr_pr is None:
+            continue
+        tr_spacing = tr_pr.find(_w("tblCellSpacing"))
+        if tr_spacing is not None:
+            tr_pr.remove(tr_spacing)
+
+
+def _clear_table_row_property_exceptions(tbl_el) -> None:
+    # Remove per-row table property exceptions (tblPrEx), which can override
+    # table-level borders and create dashed/double-outline artifacts.
+    for tr in tbl_el.findall(_w("tr")):
+        tbl_pr_ex = tr.find(_w("tblPrEx"))
+        if tbl_pr_ex is not None:
+            tr.remove(tbl_pr_ex)
+
+
+def _clear_cell_border_overrides(tbl_el) -> None:
+    for tc in tbl_el.iter(_w("tc")):
+        tc_pr = tc.find(_w("tcPr"))
+        if tc_pr is None:
+            continue
+        tc_borders = tc_pr.find(_w("tcBorders"))
+        if tc_borders is not None:
+            tc_pr.remove(tc_borders)
+
+
+def _set_table_borders_single(tbl_el, size_eighth_pt: int = 4) -> None:
+    tbl_pr = tbl_el.find(_w("tblPr"))
+    if tbl_pr is None:
+        tbl_pr = etree.SubElement(tbl_el, _w("tblPr"))
+        tbl_el.insert(0, tbl_pr)
+    old = tbl_pr.find(_w("tblBorders"))
+    if old is not None:
+        tbl_pr.remove(old)
+    borders = etree.SubElement(tbl_pr, _w("tblBorders"))
+    sz = str(max(1, int(size_eighth_pt)))
+    for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        border = etree.SubElement(borders, _w(side))
+        border.set(_w("val"), "single")
+        border.set(_w("sz"), sz)
+        border.set(_w("space"), "0")
+        border.set(_w("color"), "000000")
+
+
+def _clear_table_paragraph_indents(tbl_el) -> None:
+    for tc in tbl_el.iter(_w("tc")):
+        for p in tc.iter(_w("p")):
+            p_pr = p.find(_w("pPr"))
+            if p_pr is None:
+                p_pr = etree.SubElement(p, _w("pPr"))
+                p.insert(0, p_pr)
+            p_style = p_pr.find(_w("pStyle"))
+            if p_style is not None:
+                p_pr.remove(p_style)
+            ind = p_pr.find(_w("ind"))
+            if ind is None:
+                ind = etree.SubElement(p_pr, _w("ind"))
+            for attr in (
+                    "left", "leftChars", "right", "rightChars",
+                    "firstLine", "firstLineChars", "hanging", "hangingChars"):
+                ind.set(_w(attr), "0")
+            spacing = p_pr.find(_w("spacing"))
+            if spacing is None:
+                spacing = etree.SubElement(p_pr, _w("spacing"))
+            spacing.set(_w("before"), "0")
+            spacing.set(_w("after"), "0")
+            spacing.set(_w("line"), "240")
+            spacing.set(_w("lineRule"), "auto")
+
+
+def _center_table_cells(tbl_el) -> None:
+    for tc in tbl_el.iter(_w("tc")):
+        tc_pr = tc.find(_w("tcPr"))
+        if tc_pr is None:
+            tc_pr = etree.SubElement(tc, _w("tcPr"))
+            tc.insert(0, tc_pr)
+        v_align = tc_pr.find(_w("vAlign"))
+        if v_align is None:
+            v_align = etree.SubElement(tc_pr, _w("vAlign"))
+        v_align.set(_w("val"), "center")
+
+        for p in tc.iter(_w("p")):
+            p_pr = p.find(_w("pPr"))
+            if p_pr is None:
+                p_pr = etree.SubElement(p, _w("pPr"))
+                p.insert(0, p_pr)
+            jc = p_pr.find(_w("jc"))
+            if jc is None:
+                jc = etree.SubElement(p_pr, _w("jc"))
+            jc.set(_w("val"), "center")
+
+
+def _set_table_alignment_center(tbl_el) -> None:
+    tbl_pr = tbl_el.find(_w("tblPr"))
+    if tbl_pr is None:
+        tbl_pr = etree.SubElement(tbl_el, _w("tblPr"))
+        tbl_el.insert(0, tbl_pr)
+    jc = tbl_pr.find(_w("jc"))
+    if jc is None:
+        jc = etree.SubElement(tbl_pr, _w("jc"))
+    jc.set(_w("val"), "center")
+    tbl_ind = tbl_pr.find(_w("tblInd"))
+    if tbl_ind is not None:
+        tbl_pr.remove(tbl_ind)
+
+
+def _set_table_widths(tbl_el, widths: list[int]) -> None:
+    if not widths:
+        return
+    total = max(1, int(sum(widths)))
+    col_count = len(widths)
+
+    tbl_pr = tbl_el.find(_w("tblPr"))
+    if tbl_pr is None:
+        tbl_pr = etree.SubElement(tbl_el, _w("tblPr"))
+        tbl_el.insert(0, tbl_pr)
+    tbl_w = tbl_pr.find(_w("tblW"))
+    if tbl_w is None:
+        tbl_w = etree.SubElement(tbl_pr, _w("tblW"))
+    tbl_w.set(_w("type"), "dxa")
+    tbl_w.set(_w("w"), str(total))
+
+    layout = tbl_pr.find(_w("tblLayout"))
+    if layout is None:
+        layout = etree.SubElement(tbl_pr, _w("tblLayout"))
+    layout.set(_w("type"), "fixed")
+
+    tbl_grid = tbl_el.find(_w("tblGrid"))
+    if tbl_grid is None:
+        tbl_grid = etree.SubElement(tbl_el, _w("tblGrid"))
+        tbl_pr.addnext(tbl_grid)
+    else:
+        for col in list(tbl_grid):
+            tbl_grid.remove(col)
+    for w in widths:
+        grid_col = etree.SubElement(tbl_grid, _w("gridCol"))
+        grid_col.set(_w("w"), str(max(1, int(w))))
+
+    for tr in tbl_el.findall(_w("tr")):
+        tcs = tr.findall(_w("tc"))
+        for idx, tc in enumerate(tcs):
+            width = widths[min(idx, col_count - 1)]
+            tc_pr = tc.find(_w("tcPr"))
+            if tc_pr is None:
+                tc_pr = etree.SubElement(tc, _w("tcPr"))
+                tc.insert(0, tc_pr)
+            tc_w = tc_pr.find(_w("tcW"))
+            if tc_w is None:
+                tc_w = etree.SubElement(tc_pr, _w("tcW"))
+            tc_w.set(_w("type"), "dxa")
+            tc_w.set(_w("w"), str(max(1, int(width))))
+
+
+def normalize_markdown_table(doc, table, headers: list[str], rows: list[list[str]]) -> None:
+    """Apply Word-native table style + content-aware width allocation."""
+    try:
+        _set_native_table_style(table._tbl)
+        _clear_table_cell_spacing(table._tbl)
+        _clear_table_row_property_exceptions(table._tbl)
+        _clear_cell_border_overrides(table._tbl)
+        _set_table_borders_single(table._tbl, size_eighth_pt=4)
+        _set_table_alignment_center(table._tbl)
+        total_w = _available_page_width_twips(doc)
+        widths = _table_col_widths(headers, rows, total_w)
+        _set_table_widths(table._tbl, widths)
+        _clear_table_paragraph_indents(table._tbl)
+        _center_table_cells(table._tbl)
+    except Exception as exc:
+        logger.debug("normalize_markdown_table skipped: %s", exc)
+
+
+def normalize_markdown_table_visual_only(table) -> None:
+    """Apply markdown table border/alignment normalization without resizing columns."""
+    try:
+        _set_native_table_style(table._tbl)
+        _clear_table_cell_spacing(table._tbl)
+        _clear_table_row_property_exceptions(table._tbl)
+        _clear_cell_border_overrides(table._tbl)
+        _set_table_borders_single(table._tbl, size_eighth_pt=4)
+        _set_table_alignment_center(table._tbl)
+        _clear_table_paragraph_indents(table._tbl)
+        _center_table_cells(table._tbl)
+    except Exception as exc:
+        logger.debug("normalize_markdown_table_visual_only skipped: %s", exc)
+
+
+def write_table_cell(
+        cell,
+        text: str,
+        *,
+        image_base_path: str | None = None,
+        prefer_real_image: bool = False) -> None:
     """渲染表格单元格：支持 <br> 换行和行内格式。
 
     将 cell.text = ... 替换为带格式的渲染。
@@ -329,14 +737,19 @@ def write_table_cell(cell, text: str) -> None:
     para = cell.paragraphs[0]
 
     # 按 <br> 分割为多段
-    import re
-    parts = re.split(r'<br\s*/?\s*>', text, flags=re.IGNORECASE)
+    parts = _RE_BR_SPLIT.split(text)
 
     for idx, part in enumerate(parts):
         if idx > 0:
             para = cell.add_paragraph()
         spans = parse_inline(part.strip())
-        write_spans(para, spans, clear_existing=False)
+        write_spans(
+            para,
+            spans,
+            clear_existing=False,
+            image_base_path=image_base_path,
+            prefer_real_image=prefer_real_image,
+        )
 
 
 # ── 图片插入 ──
@@ -348,14 +761,30 @@ def insert_image(para, alt: str, src: str,
 
     Returns: True 如果成功插入图片，False 如果回退文本。
     """
-    # 解析图片路径
-    if base_path:
-        img_path = Path(base_path) / src
-    else:
-        img_path = Path(src)
+    # 解析图片路径并验证安全性
+    try:
+        if base_path:
+            base = Path(base_path).resolve()
+            img_path = (base / src).resolve()
+            # 验证路径在允许范围内
+            try:
+                img_path.relative_to(base)
+            except ValueError:
+                logger.warning(f"Image path outside base directory: {src}")
+                run = para.add_run(f"[图片路径不安全: {alt or src}]")
+                run.italic = True
+                run.font.color.rgb = RGBColor(255, 0, 0)
+                return False
+        else:
+            img_path = Path(src).resolve()
+    except Exception as e:
+        logger.warning(f"Invalid image path {src}: {e}")
+        run = para.add_run(f"[图片路径无效: {alt or src}]")
+        run.italic = True
+        return False
 
     if not img_path.exists():
-        # 回退：斜体显示 alt 文本
+        logger.debug(f"Image not found: {img_path}")
         run = para.add_run(f"[图片: {alt or src}]")
         run.italic = True
         return False
@@ -363,8 +792,10 @@ def insert_image(para, alt: str, src: str,
     try:
         run = para.add_run()
         run.add_picture(str(img_path), width=Cm(max_width_cm))
+        apply_safe_picture_line_spacing(para)
         return True
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to insert image {img_path}: {e}")
         run = para.add_run(f"[图片加载失败: {alt or src}]")
         run.italic = True
         return False
