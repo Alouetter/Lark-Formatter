@@ -1,4 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
+# Optional one-file packaging spec kept for manual/local use.
+# Current standard release packaging uses: Lark-Formatter_v0.20_LTS.spec
 
 
 a = Analysis(

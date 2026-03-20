@@ -45,6 +45,7 @@ from src.docx_io.sanitize import sanitize_docx, docx_needs_sanitization
 from src.docx_io.compare import generate_compare_doc
 from src.docx_io.field_refresh import refresh_doc_fields_with_word
 from src.docx_io.mathtype_office_fallback import apply_mathtype_office_fallback
+from src.utils.runtime_features import mathtype_office_fallback_forced_disabled
 
 
 @dataclass
@@ -333,8 +334,10 @@ class Pipeline:
 
         disable_refresh = os.environ.get("DOCX_DISABLE_FIELD_REFRESH", "").strip() == "1"
         planned_refresh_step = bool(self.config.output.final_docx and not disable_refresh)
+        disable_office_fallback = mathtype_office_fallback_forced_disabled()
         planned_fallback_step = bool(
             self.config.output.final_docx
+            and not disable_office_fallback
             and getattr(getattr(self.config, "formula_convert", None), "office_fallback_enabled", False)
         )
         # 阶段：加载、结构分析、规则执行、保存、(可选)MathType 兜底、(可选)域刷新、报告
@@ -477,7 +480,7 @@ class Pipeline:
         formula_convert_cfg = getattr(self.config, "formula_convert", None)
         office_fallback_enabled = bool(
             getattr(formula_convert_cfg, "office_fallback_enabled", False)
-        )
+        ) and not disable_office_fallback
         office_fallback_timeout = int(
             getattr(formula_convert_cfg, "office_fallback_timeout_sec", 30) or 30
         )
@@ -644,8 +647,10 @@ class Pipeline:
 
         disable_refresh = os.environ.get("DOCX_DISABLE_FIELD_REFRESH", "").strip() == "1"
         planned_refresh_step = bool(self.config.output.final_docx and not disable_refresh)
+        disable_office_fallback = mathtype_office_fallback_forced_disabled()
         planned_fallback_step = bool(
             self.config.output.final_docx
+            and not disable_office_fallback
             and getattr(getattr(self.config, "formula_convert", None), "office_fallback_enabled", False)
         )
         total_steps = len(self.steps) + 4 + (1 if planned_refresh_step else 0) + (1 if planned_fallback_step else 0)
@@ -788,7 +793,7 @@ class Pipeline:
             formula_convert_cfg = getattr(self.config, "formula_convert", None)
             office_fallback_enabled = bool(
                 getattr(formula_convert_cfg, "office_fallback_enabled", False)
-            )
+            ) and not disable_office_fallback
             office_fallback_timeout = int(
                 getattr(formula_convert_cfg, "office_fallback_timeout_sec", 30) or 30
             )

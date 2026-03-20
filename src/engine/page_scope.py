@@ -15,6 +15,7 @@ from pathlib import Path
 
 from docx import Document
 from lxml import etree
+from src.utils.runtime_features import word_page_scope_forced_disabled
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _PAGE_BREAK = f"{{{_W_NS}}}br"
@@ -534,6 +535,8 @@ def _resolve_word_paragraph_page_spans(
     source_doc_path: str | Path | None = None,
     timeout_sec: int | None = None,
 ) -> list[tuple[int, int]]:
+    if word_page_scope_forced_disabled():
+        raise RuntimeError("当前运行环境不支持“指定修正范围”；请改用自动识别分区。")
     if os.name != "nt":
         raise RuntimeError("真实页码解析仅支持 Windows + Microsoft Word。")
 

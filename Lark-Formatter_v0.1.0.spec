@@ -1,4 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
+# Legacy release spec kept for local reference.
+# Current release packaging uses: Lark-Formatter_v0.20_LTS.spec
 
 datas = [
     ("src/scene/presets", "templates"),
@@ -47,5 +49,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name="Lark-Formatter_v0.1.0",
+    name="Lark-Formatter_v0.2.0",
 )

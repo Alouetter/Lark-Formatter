@@ -34,8 +34,8 @@ _CONFIRM_TEXT = "\u786e\u5b9a"
 _FORMAT_LOADING_TEXT = "\u672a\u52a0\u8f7d"
 _FORMAT_UNSIGNED_TEXT = "\u672a\u7f72\u540d"
 _FORMAT_LINE_TEMPLATE = (
-    "\u683c\u5f0f\u914d\u7f6e\uff1a{format_name} | "
-    "\u683c\u5f0f\u7f72\u540d\uff1a{signature}"
+    "\u683c\u5f0f\u540d\u79f0\uff1a{format_name} | "
+    "\u683c\u5f0f\u914d\u7f6e\uff1a{signature}"
 )
 _ADD_SIGNATURE_TEXT = "\u589e\u52a0\u7f72\u540d"
 _SIGNED_SIGNATURE_TEXT = "\u5df2\u6c38\u4e45\u7f72\u540d"

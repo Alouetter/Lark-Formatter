@@ -94,6 +94,11 @@ from src.utils.indent import (
     resolve_pt_indent_value,
     sync_style_config_indent_fields,
 )
+from src.utils.runtime_features import (
+    is_macos_packaged_runtime,
+    mathtype_office_fallback_forced_disabled,
+    word_page_scope_forced_disabled,
+)
 
 
 class ScrollSafeComboBox(QComboBox):
@@ -4924,6 +4929,47 @@ class MainWindow(QMainWindow):
         self.resize(target_w, target_h)
 
     @staticmethod
+    def _manual_page_scope_runtime_supported() -> bool:
+        return not word_page_scope_forced_disabled()
+
+    @staticmethod
+    def _mathtype_office_fallback_runtime_supported() -> bool:
+        return not mathtype_office_fallback_forced_disabled()
+
+    def _apply_runtime_feature_guards_to_config(self, cfg: SceneConfig | None) -> None:
+        if cfg is None:
+            return
+
+        if not self._manual_page_scope_runtime_supported():
+            scope = cfg.format_scope
+            scope.mode = "auto"
+            scope.page_ranges_text = ""
+            scope.body_start_page = None
+            scope.body_start_index = None
+            scope.body_start_keyword = ""
+
+        if not self._mathtype_office_fallback_runtime_supported():
+            cfg.formula_convert.office_fallback_enabled = False
+
+    def _apply_runtime_feature_guards_to_scope_controls(self) -> None:
+        if self._manual_page_scope_runtime_supported():
+            self._radio_manual.setVisible(True)
+            self._radio_manual.setEnabled(True)
+            return
+
+        if self._scope_mode_group.checkedId() == 1:
+            self._radio_auto.setChecked(True)
+        self._radio_manual.setVisible(False)
+        self._radio_manual.setEnabled(False)
+        self._manual_inline.setVisible(False)
+        self._page_ranges_edit.clear()
+
+        if is_macos_packaged_runtime():
+            hint = "macOS 封包版不支持“指定修正范围”；请使用“自动识别分区”。"
+            self._scope_mode_label.setToolTip(hint)
+            self._radio_auto.setToolTip(hint)
+
+    @staticmethod
     def _load_svg_icon(svg_path: Path, size: int = 20):
         """Render an SVG file into a QIcon via QSvgRenderer for reliable display."""
         from PySide6.QtGui import QIcon, QPixmap, QPainter
@@ -5406,6 +5452,7 @@ class MainWindow(QMainWindow):
 
         # 信号：切换自动/手动时显示/隐藏输入框
         self._scope_mode_group.idToggled.connect(self._on_scope_mode_changed)
+        self._apply_runtime_feature_guards_to_scope_controls()
 
         self._main_layout.addWidget(card)
 
@@ -6479,6 +6526,7 @@ class MainWindow(QMainWindow):
                 page_ranges_text = ""
         if page_ranges_text is not None:
             self._page_ranges_edit.setText(str(page_ranges_text))
+        self._apply_runtime_feature_guards_to_scope_controls()
 
         sections = controls.get("sections", {})
         if isinstance(sections, dict):
@@ -6739,6 +6787,7 @@ class MainWindow(QMainWindow):
             if page is not None and isinstance(page, int) and page >= 1:
                 page_ranges_text = f"{page}-{page}"
         self._page_ranges_edit.setText(page_ranges_text)
+        self._apply_runtime_feature_guards_to_scope_controls()
         for key, cb in self._scope_checks.items():
             cb.setChecked(bool(scope.sections.get(key, True)))
         self._sync_scope_all_state()
@@ -6952,6 +7001,7 @@ class MainWindow(QMainWindow):
         caps = self._config.capabilities or {}
         has_heading = caps.get("heading_numbering", True)
         has_sections = caps.get("section_detection", True)
+        allow_manual_scope = has_sections and self._manual_page_scope_runtime_supported()
         has_caption = caps.get("caption", True)
         has_header = caps.get("header_footer", True)
         has_toc = caps.get("toc_rebuild", True)
@@ -6967,7 +7017,9 @@ class MainWindow(QMainWindow):
         self._section_enable_row.setVisible(has_sections)
         self._section_panel.setVisible(has_sections)
         self._on_section_enable_toggled(self._section_enable_check.isChecked())
-        self._manual_inline.setVisible(has_sections and self._scope_mode_group.checkedId() == 1)
+        self._radio_manual.setVisible(allow_manual_scope)
+        self._radio_manual.setEnabled(allow_manual_scope)
+        self._manual_inline.setVisible(allow_manual_scope and self._scope_mode_group.checkedId() == 1)
         self._table_panel.setVisible(True)
         self._on_table_enable_toggled(self._table_enable_check.isChecked())
         self._scope_sep1.setVisible(has_sections)
@@ -7014,7 +7066,10 @@ class MainWindow(QMainWindow):
 
     def _on_scope_mode_changed(self, id_: int, checked: bool):
         if checked:
-            allow_manual = self._config is None or self._config.capabilities.get("section_detection", True)
+            allow_manual = (
+                (self._config is None or self._config.capabilities.get("section_detection", True))
+                and self._manual_page_scope_runtime_supported()
+            )
             self._manual_inline.setVisible(allow_manual and id_ == 1)
 
     def _on_table_layout_mode_changed(self):
@@ -7126,7 +7181,7 @@ class MainWindow(QMainWindow):
         scope = self._config.format_scope
         has_sections = caps.get("section_detection", True)
         if has_sections:
-            if self._scope_mode_group.checkedId() == 1:
+            if self._manual_page_scope_runtime_supported() and self._scope_mode_group.checkedId() == 1:
                 scope.mode = "manual"
                 manual_ranges = self._page_ranges_edit.text().strip()
                 scope.page_ranges_text = manual_ranges
@@ -7747,7 +7802,7 @@ class MainWindow(QMainWindow):
         scope = self._config.format_scope
         has_sections = caps.get("section_detection", True)
         if has_sections:
-            if self._scope_mode_group.checkedId() == 1:
+            if self._manual_page_scope_runtime_supported() and self._scope_mode_group.checkedId() == 1:
                 scope.mode = "manual"
                 manual_ranges = self._page_ranges_edit.text().strip()
                 scope.page_ranges_text = manual_ranges
@@ -7988,6 +8043,7 @@ class MainWindow(QMainWindow):
         self._progress_bar.setValue(0)
         self._progress_bar.setFormat("开始排版...")
         run_config = copy.deepcopy(self._config)
+        self._apply_runtime_feature_guards_to_config(run_config)
         self._worker = PipelineWorker(run_config, self._doc_path)
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished.connect(self._on_worker_finished)

@@ -27,6 +27,7 @@ from src.formula_core.semantics import (
 )
 from src.scene.schema import SceneConfig
 from src.utils.line_spacing import sync_spacing_ooxml
+from src.utils.ooxml import apply_explicit_rfonts
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
@@ -126,9 +127,14 @@ def _apply_run_style(
         if unify_font and run.font.name != font_name:
             run.font.name = font_name
             changed = True
+        rpr = _ensure_child(run._element, _W_NS, "rPr") if (unify_font or unify_size) else None
+        if unify_font and rpr is not None:
+            changed |= _sync_w_rpr_fonts(rpr, font_name=font_name)
         if unify_size and run.font.size != size_value:
             run.font.size = size_value
             changed = True
+        if unify_size and rpr is not None:
+            changed |= _sync_w_rpr_size(rpr, font_size_pt=font_size_pt)
     return changed
 
 
@@ -194,6 +200,52 @@ def _remove_child(parent, namespace: str, local_name: str) -> bool:
         return False
     parent.remove(node)
     return True
+
+
+def _font_attr_snapshot(w_rpr) -> dict[str, str | None]:
+    rfonts = _first_child(w_rpr, _W_NS, "rFonts")
+    if rfonts is None:
+        return {}
+    attrs = (
+        "ascii", "hAnsi", "eastAsia", "cs",
+        "hint",
+        "asciiTheme", "hAnsiTheme", "eastAsiaTheme", "csTheme", "cstheme",
+    )
+    return {
+        attr: rfonts.get(f"{{{_W_NS}}}{attr}")
+        for attr in attrs
+    }
+
+
+def _target_half_pt(font_size_pt: float) -> str:
+    return str(max(1, int(round(float(font_size_pt) * 2))))
+
+
+def _sync_w_rpr_fonts(w_rpr, *, font_name: str) -> bool:
+    if not font_name:
+        return False
+    before = _font_attr_snapshot(w_rpr)
+    apply_explicit_rfonts(
+        w_rpr,
+        font_cn=font_name,
+        font_en=font_name,
+        font_cs=font_name,
+        hint="default",
+    )
+    after = _font_attr_snapshot(w_rpr)
+    return before != after
+
+
+def _sync_w_rpr_size(w_rpr, *, font_size_pt: float) -> bool:
+    changed = False
+    target_size = _target_half_pt(font_size_pt)
+    key = f"{{{_W_NS}}}val"
+    for local_name in ("sz", "szCs"):
+        node = _ensure_child(w_rpr, _W_NS, local_name)
+        if node.get(key) != target_size:
+            node.set(key, target_size)
+            changed = True
+    return changed
 
 
 def _local_name(node) -> str:
@@ -699,7 +751,6 @@ def _apply_omml_run_style(
         return False
 
     changed = False
-    target_size = str(max(1, int(round(float(font_size_pt) * 2))))
     m_runs = para._p.xpath(
         ".//*[namespace-uri()='%s' and local-name()='r']" % _M_NS
     )
@@ -707,22 +758,9 @@ def _apply_omml_run_style(
         m_rpr = _ensure_child(m_run, _M_NS, "rPr")
         w_rpr = _ensure_child(m_rpr, _W_NS, "rPr")
         if unify_font:
-            w_fonts = _ensure_child(w_rpr, _W_NS, "rFonts")
-            for attr in ("ascii", "hAnsi", "eastAsia", "cs"):
-                key = f"{{{_W_NS}}}{attr}"
-                if w_fonts.get(key) != font_name:
-                    w_fonts.set(key, font_name)
-                    changed = True
+            changed |= _sync_w_rpr_fonts(w_rpr, font_name=font_name)
         if unify_size:
-            w_sz = _ensure_child(w_rpr, _W_NS, "sz")
-            w_szcs = _ensure_child(w_rpr, _W_NS, "szCs")
-            key = f"{{{_W_NS}}}val"
-            if w_sz.get(key) != target_size:
-                w_sz.set(key, target_size)
-                changed = True
-            if w_szcs.get(key) != target_size:
-                w_szcs.set(key, target_size)
-                changed = True
+            changed |= _sync_w_rpr_size(w_rpr, font_size_pt=font_size_pt)
     return changed
 
 
