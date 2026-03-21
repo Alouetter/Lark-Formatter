@@ -7,7 +7,9 @@ from src.engine.doc_tree import DocSection, DocTree
 from src.engine.rules.equation_table_format import EquationTableFormatRule
 from src.engine.rules.header_footer import HeaderFooterRule
 from src.engine.rules.heading_detect import HeadingDetectRule
+from src.engine.rules.heading_numbering import HeadingNumberingRule
 from src.engine.rules.section_format import SectionFormatRule
+from src.engine.rules.toc_format import TocFormatRule
 from src.scene.heading_model import get_non_numbered_heading_style_name
 from src.scene.manager import load_default_scene
 
@@ -79,6 +81,18 @@ def _outline_level(para) -> str | None:
     return outline.get(f"{{{_W_NS}}}val")
 
 
+def _has_numpr(target) -> bool:
+    element = getattr(target, "element", None)
+    if element is None:
+        element = getattr(target, "_element", None)
+    if element is None:
+        return False
+    ppr = element.find(f"{{{_W_NS}}}pPr")
+    if ppr is None:
+        return False
+    return ppr.find(f"{{{_W_NS}}}numPr") is not None
+
+
 def test_doc_tree_keeps_abstract_excerpt_as_front_matter() -> None:
     doc = _build_front_matter_excerpt_doc()
 
@@ -139,6 +153,142 @@ def test_section_format_keeps_abstract_titles_out_of_back_matter_styleref_pool()
     assert doc.paragraphs[6].style.name == non_numbered_style
     assert _outline_level(doc.paragraphs[0]) == "0"
     assert _outline_level(doc.paragraphs[2]) == "0"
+    assert _has_numpr(doc.styles[doc.paragraphs[0].style.name]) is False
+    assert _has_numpr(doc.styles[doc.paragraphs[2].style.name]) is False
+
+
+def test_front_matter_titles_do_not_inherit_heading1_style_numbering() -> None:
+    doc = Document()
+    doc.add_paragraph("目录")
+    doc.add_paragraph("第一章 绪论\t1")
+    abstract_cn = doc.add_paragraph("摘要", style="Heading 1")
+    doc.add_paragraph("中文摘要内容")
+    abstract_en = doc.add_paragraph("Abstract", style="Heading 1")
+    doc.add_paragraph("English abstract content")
+    chapter = doc.add_paragraph("绪论", style="Heading 1")
+    doc.add_paragraph("正文内容")
+    acknowledgement = doc.add_paragraph("致谢", style="Heading 1")
+    doc.add_paragraph("感谢内容")
+    references = doc.add_paragraph("参考文献", style="Heading 1")
+    doc.add_paragraph("[1] 示例参考文献")
+
+    cfg = load_default_scene()
+    tree = DocTree()
+    tree.build(doc)
+    context = {"doc_tree": tree, "format_scope": cfg.format_scope}
+
+    HeadingDetectRule().apply(doc, cfg, ChangeTracker(), context)
+    HeadingNumberingRule().apply(doc, cfg, ChangeTracker(), context)
+    SectionFormatRule().apply(doc, cfg, ChangeTracker(), context)
+
+    non_numbered_style = get_non_numbered_heading_style_name(cfg)
+
+    assert _has_numpr(doc.styles["Heading 1"]) is True
+    assert abstract_cn.style.name not in {"Heading 1", non_numbered_style}
+    assert abstract_en.style.name not in {"Heading 1", non_numbered_style}
+    assert _has_numpr(doc.styles[abstract_cn.style.name]) is False
+    assert _has_numpr(doc.styles[abstract_en.style.name]) is False
+    assert _outline_level(abstract_cn) == "0"
+    assert _outline_level(abstract_en) == "0"
+    assert chapter.style.name == "Heading 1"
+    assert acknowledgement.style.name == non_numbered_style
+    assert references.style.name == non_numbered_style
+
+
+def test_back_matter_titles_stay_unnumbered_after_heading1_numbering() -> None:
+    doc = Document()
+    chapter = doc.add_paragraph("绪论", style="Heading 1")
+    doc.add_paragraph("正文内容")
+    errata = doc.add_paragraph("勘误页", style="Heading 1")
+    doc.add_paragraph("勘误说明")
+    acknowledgement = doc.add_paragraph("致谢", style="Heading 1")
+    doc.add_paragraph("感谢内容")
+    appendix_a = doc.add_paragraph("附录A 公式推导", style="Heading 1")
+    doc.add_paragraph("附录A 内容")
+    appendix_b = doc.add_paragraph("附录B 补充实验", style="Heading 1")
+    doc.add_paragraph("附录B 内容")
+    resume = doc.add_paragraph("个人简历", style="Heading 1")
+    doc.add_paragraph("个人简历内容")
+    resume_subtitle = doc.add_paragraph("在学期间发表的学术论文与研究成果", style="Heading 1")
+    doc.add_paragraph("成果列表")
+    references = doc.add_paragraph("参考文献", style="Heading 1")
+    doc.add_paragraph("[1] 示例参考文献")
+
+    cfg = load_default_scene()
+    tree = DocTree()
+    tree.build(doc)
+    assert [sec.section_type for sec in tree.sections] == [
+        "body",
+        "errata",
+        "acknowledgment",
+        "appendix",
+        "resume",
+        "references",
+    ]
+
+    context = {"doc_tree": tree, "format_scope": cfg.format_scope}
+    HeadingDetectRule().apply(doc, cfg, ChangeTracker(), context)
+    HeadingNumberingRule().apply(doc, cfg, ChangeTracker(), context)
+    SectionFormatRule().apply(doc, cfg, ChangeTracker(), context)
+
+    non_numbered_style = get_non_numbered_heading_style_name(cfg)
+
+    assert _has_numpr(doc.styles["Heading 1"]) is True
+    assert chapter.style.name == "Heading 1"
+    for para in (
+        errata,
+        acknowledgement,
+        appendix_a,
+        appendix_b,
+        resume,
+        resume_subtitle,
+        references,
+    ):
+        assert para.style.name == non_numbered_style
+        assert _outline_level(para) == "0"
+
+
+def test_native_toc_keeps_front_and_back_matter_entries_without_numbering() -> None:
+    doc = Document()
+    doc.add_paragraph("目录")
+    doc.add_paragraph("旧目录条目\t1")
+    doc.add_paragraph("旧目录条目\t2")
+    doc.add_paragraph("摘要", style="Heading 1")
+    doc.add_paragraph("中文摘要内容")
+    doc.add_paragraph("Abstract", style="Heading 1")
+    doc.add_paragraph("English abstract content")
+    doc.add_paragraph("绪论", style="Heading 1")
+    doc.add_paragraph("正文内容")
+    doc.add_paragraph("致谢", style="Heading 1")
+    doc.add_paragraph("感谢内容")
+    doc.add_paragraph("参考文献", style="Heading 1")
+    doc.add_paragraph("[1] 示例参考文献")
+
+    cfg = load_default_scene()
+    tree = DocTree()
+    tree.build(doc)
+    context = {"doc_tree": tree, "format_scope": cfg.format_scope}
+
+    HeadingDetectRule().apply(doc, cfg, ChangeTracker(), context)
+    HeadingNumberingRule().apply(doc, cfg, ChangeTracker(), context)
+    SectionFormatRule().apply(doc, cfg, ChangeTracker(), context)
+    TocFormatRule().apply(doc, cfg, ChangeTracker(), context)
+
+    toc = tree.get_section("toc")
+    assert toc is not None
+    toc_texts = [
+        (doc.paragraphs[i].text or "").strip()
+        for i in range(toc.start_index, toc.end_index + 1)
+        if (doc.paragraphs[i].text or "").strip()
+    ]
+    labels = [text.split("\t", 1)[0] for text in toc_texts]
+
+    assert "摘要" in labels
+    assert "Abstract" in labels
+    assert "致谢" in labels
+    assert "参考文献" in labels
+    assert any("绪论" in label for label in labels)
+    assert all("第一章" not in text for text in toc_texts if text.split("\t", 1)[0] in {"摘要", "Abstract", "致谢", "参考文献"})
 
 
 def test_heading_detect_skips_tabular_measurement_rows() -> None:

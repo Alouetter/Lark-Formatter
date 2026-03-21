@@ -68,6 +68,7 @@ _NON_NUMBERED_TITLE_TEXTS = {
     "在学期间发表的学术论文与研究成果",
 }
 _NON_NUMBERED_HEADING_STYLE_NAME = "Heading 1 Unnumbered"
+_FRONT_MATTER_HEADING_STYLE_NAME = "Front Matter Heading Unnumbered"
 
 ALIGNMENT_MAP = {
     "left": WD_ALIGN_PARAGRAPH.LEFT,
@@ -3387,9 +3388,13 @@ class SectionFormatRule(BaseRule):
 
             para = doc.paragraphs[title_idx]
             # Keep abstract titles as unnumbered headings so native TOC can collect
-            # them, but TOC title itself must not become an outline-level heading.
+            # them, but isolate them from Heading 1 / back-matter unnumbered styles.
             if sec_type != "toc":
-                self._make_para_unnumbered(doc, para, apply_style=False)
+                self._make_para_unnumbered(
+                    doc,
+                    para,
+                    style_name=_FRONT_MATTER_HEADING_STYLE_NAME,
+                )
             _lstrip_para_leading_space(para)
             self._format_paragraph(
                 para,
@@ -3700,14 +3705,24 @@ class SectionFormatRule(BaseRule):
                 paragraph_index=-1,
             )
 
-    def _make_para_unnumbered(self, doc, para, *, apply_style: bool = True) -> None:
+    def _make_para_unnumbered(
+        self,
+        doc,
+        para,
+        *,
+        apply_style: bool = True,
+        style_name: str | None = None,
+    ) -> None:
         """Keep heading semantics but remove auto-number participation.
 
-        apply_style=False keeps the paragraph's existing style while still
-        marking it as an outline-level heading (used for 摘要/Abstract titles).
+        style_name can point to a dedicated outline-level style so front-matter
+        titles stay unnumbered without inheriting Heading 1 numbering.
         """
         if apply_style:
-            heading_style = self._ensure_non_numbered_heading_style(doc)
+            if style_name:
+                heading_style = self._ensure_unnumbered_heading_style(doc, style_name=style_name)
+            else:
+                heading_style = self._ensure_non_numbered_heading_style(doc)
             if heading_style is not None:
                 para.style = heading_style
 
@@ -3728,6 +3743,10 @@ class SectionFormatRule(BaseRule):
         """Ensure the unnumbered chapter-heading style exists and return it."""
         active_cfg = getattr(self, "_active_config", None) or SceneConfig()
         style_name = get_non_numbered_heading_style_name(active_cfg) or _NON_NUMBERED_HEADING_STYLE_NAME
+        return self._ensure_unnumbered_heading_style(doc, style_name=style_name)
+
+    def _ensure_unnumbered_heading_style(self, doc, *, style_name: str):
+        """Ensure a dedicated outline-level heading style exists without numbering."""
 
         try:
             style = doc.styles[style_name]

@@ -16,6 +16,7 @@ from src.scene.heading_model import (
     detect_level_by_style_name,
     get_front_matter_title_norms,
     get_level_to_word_style,
+    get_non_numbered_heading_style_name,
 )
 from src.scene.schema import SceneConfig, StyleConfig
 from src.engine.doc_tree import DocTree
@@ -45,6 +46,7 @@ _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _TOC_BOOKMARK_PREFIX = "_TocRef_"
 _TOC_MODE_WORD_NATIVE = "word_native"
 _TOC_MODE_PLAIN = "plain"
+_FRONT_MATTER_HEADING_STYLE_NAME = "Front Matter Heading Unnumbered"
 
 
 def _w(tag: str) -> str:
@@ -69,20 +71,39 @@ def _configured_toc_levels(config: SceneConfig) -> list[str]:
 def _native_toc_field_instruction(config: SceneConfig) -> str:
     """Build TOC field instruction using outline-level switch (\\o).
 
-    Previous implementation used \\t (style-name matching), which is
-    case-sensitive and breaks on WPS-created documents where built-in heading
-    styles are stored as lowercase ``heading 1`` instead of ``Heading 1``.
+    Built-in heading levels are collected via ``\\o``/``\\u`` to stay resilient
+    to WPS / locale / case differences. Custom unnumbered heading styles used by
+    front/back matter are appended via ``\\t`` so Word refresh keeps those
+    entries in native TOC.
 
-    The \\o switch matches paragraphs by their ``outlineLvl`` property, which
-    is always a numeric value set on the style definition and is therefore
-    immune to locale / case / office-suite differences.
+    Relying on ``\\t`` alone is brittle for built-in heading styles because style
+    names can vary in case across office suites.
     """
     levels = _configured_toc_levels(config)
     if not levels:
         max_level = 3
     else:
         max_level = max(int(lv[7:]) for lv in levels)
-    return f' TOC \\o "1-{max_level}" \\h \\z \\u '
+    custom_styles = [
+        _FRONT_MATTER_HEADING_STYLE_NAME,
+        get_non_numbered_heading_style_name(config),
+    ]
+    seen: set[str] = set()
+    style_pairs: list[str] = []
+    for style_name in custom_styles:
+        style_text = str(style_name or "").strip()
+        if not style_text:
+            continue
+        lowered = style_text.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        style_pairs.append(f"{style_text},1")
+
+    style_switch = ""
+    if style_pairs:
+        style_switch = f' \\t "{",".join(style_pairs)}"'
+    return f' TOC \\o "1-{max_level}" \\h \\z \\u{style_switch} '
 
 
 # ── 编号文本生成 ──
@@ -1451,12 +1472,18 @@ class TocFormatRule(BaseRule):
                 return
             _purge_generated_toc_bookmarks(doc)
             levels_config = config.heading_numbering.levels
-            native_seed_entries = _build_toc_entries(
-                doc,
-                sorted(headings, key=lambda h: getattr(h, "para_index", 10**9)),
-                levels_config,
-                config.heading_numbering_v2.level_bindings,
+            native_seed_entries = []
+            native_seed_entries.extend(_build_front_matter_toc_entries(doc, doc_tree))
+            native_seed_entries.extend(_build_back_matter_toc_entries(doc, doc_tree))
+            native_seed_entries.extend(
+                _build_toc_entries(
+                    doc,
+                    sorted(headings, key=lambda h: getattr(h, "para_index", 10**9)),
+                    levels_config,
+                    config.heading_numbering_v2.level_bindings,
+                )
             )
+            native_seed_entries.sort(key=lambda e: e.get("para_index", 10**9))
             native_seed_entries = _dedupe_entries(native_seed_entries)
 
             ps = config.page_setup

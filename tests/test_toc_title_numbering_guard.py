@@ -76,6 +76,9 @@ def test_native_toc_field_instruction_tracks_v2_include_in_toc_levels():
     assert '\\h' in instruction
     assert '\\z' in instruction
     assert '\\u' in instruction
+    assert '\\t "' in instruction
+    assert 'Front Matter Heading Unnumbered,1' in instruction
+    assert 'Heading 1 Unnumbered,1' in instruction
 
 
 def test_build_toc_entries_respects_hidden_levels_but_keeps_numbering_counters():
