@@ -1,4 +1,4 @@
-﻿"""Section-format rule: apply style config by detected document sections."""
+"""Section-format rule: apply style config by detected document sections."""
 
 from __future__ import annotations
 
@@ -31,7 +31,12 @@ from src.scene.heading_model import (
 )
 from src.scene.schema import FormatScopeConfig, SceneConfig
 from src.utils.indent import apply_style_config_indents, style_config_indent_kwargs, sync_indent_ooxml
-from src.utils.line_spacing import apply_line_spacing, apply_safe_picture_line_spacing, sync_spacing_ooxml
+from src.utils.line_spacing import (
+    apply_line_spacing,
+    apply_safe_picture_line_spacing,
+    apply_style_paragraph_spacing,
+    sync_style_spacing_ooxml,
+)
 from src.utils.ooxml import apply_explicit_rfonts
 
 # section_type -> style key
@@ -464,6 +469,33 @@ def _clear_para_num_pr(para) -> None:
         ppr.remove(numpr)
 
 
+def _para_has_intentional_numbering(para) -> bool:
+    """段落是否有有意的编号（numId > 0），而非仅由样式继承的 numId=0。"""
+    ppr = para._element.find(f"{{{_W_NS}}}pPr")
+    if ppr is None:
+        return False
+    numpr = ppr.find(f"{{{_W_NS}}}numPr")
+    if numpr is None:
+        return False
+    numid = numpr.find(f"{{{_W_NS}}}numId")
+    if numid is None:
+        return False
+    val = numid.get(f"{{{_W_NS}}}val", "0")
+    try:
+        return int(val) > 0
+    except (ValueError, TypeError):
+        return False
+
+
+def _clone_base_sectpr_clean(base_sectpr):
+    """深拷贝 base sectPr 并剥离 header/footer 引用，避免多 section 共享同一个 header XML。"""
+    new_sect = deepcopy(base_sectpr)
+    for ref_tag in ("headerReference", "footerReference"):
+        for ref_el in list(new_sect.findall(f"{{{_W_NS}}}{ref_tag}")):
+            new_sect.remove(ref_el)
+    return new_sect
+
+
 def _para_is_special_block(para) -> bool:
     """Paragraphs tagged by md_cleanup as code/quote blocks."""
     ppr = para._element.find(f"{{{_W_NS}}}pPr")
@@ -762,20 +794,13 @@ def _normalize_reference_entry_paragraph(para, style_config=None) -> bool:
 
     align_key = getattr(style_config, "alignment", "left")
     pf.alignment = ALIGNMENT_MAP.get(align_key, WD_ALIGN_PARAGRAPH.LEFT)
-    pf.space_before = Pt(getattr(style_config, "space_before_pt", 0.0))
-    pf.space_after = Pt(getattr(style_config, "space_after_pt", 0.0))
+    apply_style_paragraph_spacing(pf, style_config)
     apply_line_spacing(
         pf,
         getattr(style_config, "line_spacing_type", "exact"),
         getattr(style_config, "line_spacing_pt", 20.0),
     )
-    sync_spacing_ooxml(
-        para._element,
-        space_before_pt=getattr(style_config, "space_before_pt", 0.0),
-        space_after_pt=getattr(style_config, "space_after_pt", 0.0),
-        line_spacing_type=getattr(style_config, "line_spacing_type", "exact"),
-        line_spacing_value=getattr(style_config, "line_spacing_pt", 20.0),
-    )
+    sync_style_spacing_ooxml(para._element, style_config)
     left_pt, first_pt, hanging_pt, right_pt = apply_style_config_indents(pf, para._element, style_config)
     _sanitize_para_indent_ooxml(
         para,
@@ -3715,7 +3740,7 @@ class SectionFormatRule(BaseRule):
                 prev_el.insert(0, prev_ppr)
 
             if base_sectpr is not None:
-                new_sect = deepcopy(base_sectpr)
+                new_sect = _clone_base_sectpr_clean(base_sectpr)
             else:
                 new_sect = etree.SubElement(prev_ppr, f"{{{_W_NS}}}sectPr")
             prev_ppr.append(new_sect)
@@ -3795,7 +3820,7 @@ class SectionFormatRule(BaseRule):
                 prev_el.insert(0, prev_ppr)
 
             if base_sectpr is not None:
-                new_sect = deepcopy(base_sectpr)
+                new_sect = _clone_base_sectpr_clean(base_sectpr)
             else:
                 new_sect = etree.SubElement(prev_ppr, f"{{{_W_NS}}}sectPr")
             prev_ppr.append(new_sect)
@@ -3899,7 +3924,7 @@ class SectionFormatRule(BaseRule):
                 prev_el.insert(0, prev_ppr)
 
             if base_sectpr is not None:
-                new_sect = deepcopy(base_sectpr)
+                new_sect = _clone_base_sectpr_clean(base_sectpr)
             else:
                 new_sect = etree.SubElement(prev_ppr, f"{{{_W_NS}}}sectPr")
             prev_ppr.append(new_sect)
@@ -4006,8 +4031,9 @@ class SectionFormatRule(BaseRule):
             style_name_low = style_name.lower()
             style_id_low = style_id.lower()
 
-            # References should not keep list-number indentation from source docs.
-            if has_list:
+            # References should not keep list-number indentation from source docs,
+            # but preserve intentional numbering (e.g. numId > 0 for reference entries).
+            if has_list and not _para_has_intentional_numbering(para):
                 _clear_para_num_pr(para)
 
             # Some docs carry numbering/indent via list styles (without local numPr).
@@ -4027,16 +4053,9 @@ class SectionFormatRule(BaseRule):
             if align_key in ALIGNMENT_MAP:
                 pf.alignment = ALIGNMENT_MAP[align_key]
 
-        pf.space_before = Pt(sc.space_before_pt)
-        pf.space_after = Pt(sc.space_after_pt)
+        apply_style_paragraph_spacing(pf, sc)
         apply_line_spacing(pf, sc.line_spacing_type, sc.line_spacing_pt)
-        sync_spacing_ooxml(
-            para._element,
-            space_before_pt=sc.space_before_pt,
-            space_after_pt=sc.space_after_pt,
-            line_spacing_type=sc.line_spacing_type,
-            line_spacing_value=sc.line_spacing_pt,
-        )
+        sync_style_spacing_ooxml(para._element, sc)
 
         if can_adjust_indent:
             left_pt, first_pt, hanging_pt, right_pt = apply_style_config_indents(pf, para._element, sc)

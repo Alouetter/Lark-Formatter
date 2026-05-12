@@ -4,6 +4,7 @@ from docx import Document
 
 from src.engine.rules.base import BaseRule, ValidationIssue
 from src.engine.change_tracker import ChangeTracker
+from src.engine.rules.heading_numbering import split_heading_text
 from src.scene.heading_model import get_level_to_word_style
 from src.scene.schema import SceneConfig
 from src.utils.toc_entry import (
@@ -209,21 +210,24 @@ class ValidationRule(BaseRule):
             text = doc.paragraphs[para_idx].text or ""
             if self._is_toc_placeholder_heading(text):
                 continue
-            if enforcement.ban_tab and "\t" in text:
+            number_part, sep_part, _ = split_heading_text(text)
+            if not number_part:
+                continue
+            if enforcement.ban_tab and "\t" in sep_part:
                 issues.append(
                     ValidationIssue(
                         level="error",
                         rule_name=self.name,
-                        message="标题中仍存在 Tab 字符",
+                        message="标题编号与标题正文之间仍存在 Tab 字符",
                         location=f"段落 #{para_idx}",
                     )
                 )
-            if enforcement.ban_double_halfwidth_space and "  " in text:
+            if enforcement.ban_double_halfwidth_space and "  " in sep_part:
                 issues.append(
                     ValidationIssue(
                         level="error",
                         rule_name=self.name,
-                        message="标题中仍存在连续两个半角空格",
+                        message="标题编号与标题正文之间仍存在连续两个半角空格",
                         location=f"段落 #{para_idx}",
                     )
                 )

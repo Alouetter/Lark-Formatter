@@ -12,11 +12,36 @@ from src.engine.change_tracker import ChangeTracker
 
 W_NS = OOXML_NS["w"]
 
+# Revision-markup tags whose w:id must be globally unique within a document.
+_REVISION_ID_TAGS = ("ins", "del", "rPrChange", "pPrChange",
+                     "sectPrChange", "tblPrChange", "trPrChange", "tcPrChange")
+
 
 def _w(tag: str) -> str:
     """生成带 w: 命名空间的完整标签名"""
     return f"{{{W_NS}}}{tag}"
 
+
+def _max_existing_revision_id(doc_element) -> int:
+    """Scan the document XML tree for the highest existing revision w:id value.
+
+    OOXML requires all revision IDs within a document to be unique.
+    By finding the current maximum, new IDs can be allocated starting
+    above it to avoid collisions.
+    """
+    max_id = 0
+    w_id = _w("id")
+    for tag_name in _REVISION_ID_TAGS:
+        for elem in doc_element.iter(_w(tag_name)):
+            raw = elem.get(w_id)
+            if raw is not None:
+                try:
+                    val = int(raw)
+                    if val > max_id:
+                        max_id = val
+                except (ValueError, TypeError):
+                    pass
+    return max_id
 
 def _make_run_props(source_run_elem):
     """从源 run 元素复制 rPr（运行属性）"""
@@ -184,7 +209,14 @@ def _insert_revision_paragraph(compare_doc: Document, insert_at: int,
         if insert_at <= 0:
             paragraphs[0]._element.addprevious(new_p)
         elif insert_at >= len(paragraphs):
-            paragraphs[-1]._element.addnext(new_p)
+            # Guard: ensure the new paragraph is inserted *before* sectPr,
+            # not after it.  OOXML requires sectPr to be the last child of
+            # w:body (ISO/IEC 29500-1 §17.6.17).
+            sect_pr = body.find(_w("sectPr"))
+            if sect_pr is not None:
+                sect_pr.addprevious(new_p)
+            else:
+                paragraphs[-1]._element.addnext(new_p)
         else:
             paragraphs[insert_at]._element.addprevious(new_p)
     else:
@@ -551,7 +583,6 @@ def generate_compare_doc(original_doc: Document,
     优先使用 original_doc 与 final_doc 的段落文本差异生成修订；
     若 final_doc 缺失，则回退到 tracker.text 记录。
     """
-    reset_revision_counter()
     # Use save/reload clone to avoid deepcopy corruption on python-docx/lxml trees.
     from io import BytesIO
     source_doc = final_doc if final_doc is not None else original_doc
@@ -559,6 +590,19 @@ def generate_compare_doc(original_doc: Document,
     source_doc.save(buf)
     buf.seek(0)
     compare_doc = Document(buf)
+
+    # Fix: start revision IDs *after* the highest ID already present in any
+    # of the input documents.  Without this, documents that already contain
+    # Track Changes markup will have colliding w:id values, causing Word to
+    # refuse to open the file (ISO/IEC 29500-1 §17.13.5 requires unique IDs).
+    # We scan both compare_doc (cloned from final/original) and original_doc
+    # because revision markup may exist in either.
+    import src.utils.ooxml as _ooxml_mod
+    existing_max = _max_existing_revision_id(compare_doc.element)
+    existing_max = max(existing_max,
+                       _max_existing_revision_id(original_doc.element))
+    _ooxml_mod._revision_id_counter = existing_max
+
     author = REVISION_AUTHOR
     date = revision_date()
 

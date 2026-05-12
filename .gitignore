@@ -10,6 +10,9 @@ venv/
 .pytest_cache/
 crash.log
 tests/
+!tests/
+tests/*
+!tests/test_paragraph_spacing_units.py
 *.docx
 
 # Build outputs

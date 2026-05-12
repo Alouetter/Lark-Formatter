@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 
 from src.utils.indent import sync_style_config_indent_fields
+from src.utils.line_spacing import sync_style_config_spacing_fields
 
 
 def heading_level_keys() -> list[str]:
@@ -442,9 +443,14 @@ class StyleConfig:
     line_spacing_pt: float = 20  # exact 时单位 pt；multiple 时表示倍数
     space_before_pt: float = 0
     space_after_pt: float = 0
+    space_before_value: float | None = None
+    space_before_unit: str = "pt"
+    space_after_value: float | None = None
+    space_after_unit: str = "pt"
 
     def __post_init__(self):
         sync_style_config_indent_fields(self)
+        sync_style_config_spacing_fields(self)
 
 
 @dataclass
@@ -614,6 +620,10 @@ class FormulaTableConfig:
     formula_line_spacing: float = 1.0
     formula_space_before_pt: float = 0.0
     formula_space_after_pt: float = 0.0
+    formula_space_before_value: float | None = None
+    formula_space_before_unit: str = "pt"
+    formula_space_after_value: float | None = None
+    formula_space_after_unit: str = "pt"
     block_alignment: str = "center"
     table_alignment: str = "center"
     formula_cell_alignment: str = "center"

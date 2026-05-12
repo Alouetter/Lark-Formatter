@@ -18,6 +18,7 @@ from src.scene.schema import HeadingLevelConfig, SceneConfig, StyleConfig
 from src.utils.heading_numbering_template import default_heading_numbering_template
 from src.utils.heading_numbering_v2 import legacy_levels_from_v2
 from src.utils.indent import sync_style_config_indent_fields
+from src.utils.line_spacing import sync_style_config_spacing_fields
 from src.ui.font_sizes import display_font_size_with_name
 from src.utils.toc_entry import (
     looks_like_numbered_toc_entry_with_page_suffix,
@@ -331,6 +332,10 @@ def _read_xml_spacing_info(obj) -> dict:
     result = {
         "before_pt": None,
         "after_pt": None,
+        "before_value": None,
+        "before_unit": None,
+        "after_value": None,
+        "after_unit": None,
         "before_explicit": False,
         "after_explicit": False,
     }
@@ -347,29 +352,41 @@ def _read_xml_spacing_info(obj) -> dict:
     except Exception:
         return result
 
-    def _read_side(name: str) -> tuple[float | None, bool]:
-        twip_attr = spacing.get(qn(f"w:{name}"))
-        if twip_attr is not None:
+    def _is_on_off_true(value) -> bool:
+        raw = str(value or "").strip().lower()
+        return raw in {"1", "true", "on", "yes"}
+
+    def _read_side(name: str) -> tuple[float | None, str | None, float | None, bool]:
+        auto_attr = spacing.get(qn(f"w:{name}Autospacing"))
+        if _is_on_off_true(auto_attr):
+            return 0.0, "auto", 0.0, True
+
+        lines_attr = spacing.get(qn(f"w:{name}Lines"))
+        if lines_attr is not None:
             try:
-                return max(0.0, int(str(twip_attr).strip()) / 20.0), True
+                lines_value = max(0.0, int(str(lines_attr).strip()) / 100.0)
+                return lines_value, "line", 0.0, True
             except (TypeError, ValueError):
                 pass
 
-        lines_attr = spacing.get(qn(f"w:{name}Lines"))
-        auto_attr = str(spacing.get(qn(f"w:{name}Autospacing"), "")).strip().lower()
-        if lines_attr is not None:
+        twip_attr = spacing.get(qn(f"w:{name}"))
+        if twip_attr is not None:
             try:
-                lines_value = int(str(lines_attr).strip())
+                pt_value = max(0.0, int(str(twip_attr).strip()) / 20.0)
+                return pt_value, "pt", pt_value, True
             except (TypeError, ValueError):
-                lines_value = None
-            if lines_value == 0 and auto_attr in {"", "0", "false", "off"}:
-                return 0.0, True
-        return None, False
+                pass
 
-    before_pt, before_explicit = _read_side("before")
-    after_pt, after_explicit = _read_side("after")
+        return None, None, None, False
+
+    before_value, before_unit, before_pt, before_explicit = _read_side("before")
+    after_value, after_unit, after_pt, after_explicit = _read_side("after")
     result["before_pt"] = before_pt
     result["after_pt"] = after_pt
+    result["before_value"] = before_value
+    result["before_unit"] = before_unit
+    result["after_value"] = after_value
+    result["after_unit"] = after_unit
     result["before_explicit"] = before_explicit
     result["after_explicit"] = after_explicit
     return result
@@ -419,11 +436,17 @@ def _build_style_config(
         before_pt = _length_pt_or_none(_first_non_none(src_style, lambda st: st.paragraph_format.space_before))
     if before_pt is not None:
         sc.space_before_pt = max(0.0, round(before_pt, 2))
+    if xml_spacing["before_explicit"] and xml_spacing["before_unit"]:
+        sc.space_before_unit = str(xml_spacing["before_unit"])
+        sc.space_before_value = max(0.0, round(float(xml_spacing["before_value"] or 0.0), 2))
     after_pt = xml_spacing["after_pt"]
     if not xml_spacing["after_explicit"]:
         after_pt = _length_pt_or_none(_first_non_none(src_style, lambda st: st.paragraph_format.space_after))
     if after_pt is not None:
         sc.space_after_pt = max(0.0, round(after_pt, 2))
+    if xml_spacing["after_explicit"] and xml_spacing["after_unit"]:
+        sc.space_after_unit = str(xml_spacing["after_unit"])
+        sc.space_after_value = max(0.0, round(float(xml_spacing["after_value"] or 0.0), 2))
 
     # --- Indentation ---
     # First, try reading character-based indent from XML (preferred).
@@ -549,6 +572,7 @@ def _build_style_config(
         sc.line_spacing_pt = round(max(0.1, float(line_spacing)), 2)
 
     sync_style_config_indent_fields(sc)
+    sync_style_config_spacing_fields(sc)
     return sc
 
 
@@ -583,11 +607,17 @@ def _build_style_config_from_paragraph(para, base: StyleConfig) -> StyleConfig:
             before_pt = _length_pt_or_none(pf.space_before)
         if before_pt is not None:
             sc.space_before_pt = max(0.0, round(before_pt, 2))
+        if xml_spacing["before_explicit"] and xml_spacing["before_unit"]:
+            sc.space_before_unit = str(xml_spacing["before_unit"])
+            sc.space_before_value = max(0.0, round(float(xml_spacing["before_value"] or 0.0), 2))
         after_pt = xml_spacing["after_pt"]
         if not xml_spacing["after_explicit"]:
             after_pt = _length_pt_or_none(pf.space_after)
         if after_pt is not None:
             sc.space_after_pt = max(0.0, round(after_pt, 2))
+        if xml_spacing["after_explicit"] and xml_spacing["after_unit"]:
+            sc.space_after_unit = str(xml_spacing["after_unit"])
+            sc.space_after_value = max(0.0, round(float(xml_spacing["after_value"] or 0.0), 2))
 
         left_indent_pt = _length_pt_or_none(pf.left_indent)
         _assign_style_indent_from_pt(sc, "left_indent", left_indent_pt)
@@ -675,6 +705,7 @@ def _build_style_config_from_paragraph(para, base: StyleConfig) -> StyleConfig:
             sc.italic = bool(italic)
 
     sync_style_config_indent_fields(sc)
+    sync_style_config_spacing_fields(sc)
     return sc
 
 
@@ -1721,6 +1752,8 @@ def _clone_page_setup(config: SceneConfig, doc: Document) -> bool:
 
     def _set_cm(attr: str, value):
         nonlocal changed
+        if value is None:
+            return
         old = getattr(ps.margin, attr)
         new = round(float(value.cm), 2)
         if abs(old - new) > 1e-6:
@@ -1732,15 +1765,19 @@ def _clone_page_setup(config: SceneConfig, doc: Document) -> bool:
     _set_cm("left_cm", sec.left_margin)
     _set_cm("right_cm", sec.right_margin)
 
-    header_new = round(float(sec.header_distance.cm), 2)
-    footer_new = round(float(sec.footer_distance.cm), 2)
-    if abs(ps.header_distance_cm - header_new) > 1e-6:
-        ps.header_distance_cm = header_new
-        changed = True
-    if abs(ps.footer_distance_cm - footer_new) > 1e-6:
-        ps.footer_distance_cm = footer_new
-        changed = True
+    if sec.header_distance is not None:
+        header_new = round(float(sec.header_distance.cm), 2)
+        if abs(ps.header_distance_cm - header_new) > 1e-6:
+            ps.header_distance_cm = header_new
+            changed = True
+    if sec.footer_distance is not None:
+        footer_new = round(float(sec.footer_distance.cm), 2)
+        if abs(ps.footer_distance_cm - footer_new) > 1e-6:
+            ps.footer_distance_cm = footer_new
+            changed = True
 
+    if sec.page_width is None or sec.page_height is None:
+        return changed
     w_cm = round(float(sec.page_width.cm), 2)
     h_cm = round(float(sec.page_height.cm), 2)
     detected_paper_size = None

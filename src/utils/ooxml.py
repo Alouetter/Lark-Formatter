@@ -13,6 +13,7 @@ from src.utils.heading_numbering_v2 import (
     normalize_start_at,
 )
 from src.utils.indent import resolve_style_config_indents
+from src.utils.line_spacing import paragraph_spacing_value_to_pt, style_spacing_side
 
 # 全局修订 ID 计数器
 _revision_id_counter = 0
@@ -133,12 +134,16 @@ def _add_lvl_ppr(lvl, style_config) -> None:
     ppr = etree.SubElement(lvl, _w("pPr"))
     # 间距
     spacing = etree.SubElement(ppr, _w("spacing"))
-    before = int(style_config.space_before_pt * 20)
-    after = int(style_config.space_after_pt * 20)
-    if before:
-        spacing.set(_w("before"), str(before))
-    if after:
-        spacing.set(_w("after"), str(after))
+    for side in ("before", "after"):
+        value, unit = style_spacing_side(style_config, side)
+        if unit == "auto":
+            spacing.set(_w(f"{side}Autospacing"), "1")
+        elif unit == "line":
+            spacing.set(_w(f"{side}Lines"), str(int(round(value * 100))))
+        else:
+            twips = int(round(paragraph_spacing_value_to_pt(value, unit) * 20))
+            if twips:
+                spacing.set(_w(side), str(twips))
     # 对齐
     alignment = _alignment_to_ooxml_jc(getattr(style_config, "alignment", ""))
     if alignment:

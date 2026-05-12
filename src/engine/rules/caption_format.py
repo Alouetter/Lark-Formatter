@@ -1,4 +1,4 @@
-﻿"""图表题注自动编号与格式修正规则"""
+"""图表题注自动编号与格式修正规则"""
 
 import re
 from dataclasses import dataclass, field
@@ -12,7 +12,7 @@ from src.engine.rules import table_format as table_helpers
 from src.engine.change_tracker import ChangeTracker
 from src.scene.schema import SceneConfig, StyleConfig
 from src.utils.indent import apply_style_config_indents, style_config_indent_kwargs, sync_indent_ooxml
-from src.utils.line_spacing import apply_line_spacing, sync_spacing_ooxml
+from src.utils.line_spacing import apply_line_spacing, apply_style_paragraph_spacing, sync_style_spacing_ooxml
 from src.utils.ooxml import apply_explicit_rfonts
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -428,8 +428,8 @@ def _extract_caption_rpr(el):
         rpr = r.find(_w("rPr"))
         if rpr is not None:
             rpr_src = _copy.deepcopy(rpr)
-            # Caption numbering should not inherit italic style.
-            for tag in ("i", "iCs"):
+            # Caption numbering should not inherit bold or italic style.
+            for tag in ("i", "iCs", "b", "bCs"):
                 it = rpr_src.find(_w(tag))
                 if it is not None:
                     rpr_src.remove(it)
@@ -544,16 +544,9 @@ def _format_caption_para(para, sc):
     pf = para.paragraph_format
     align_key = str(getattr(sc, "alignment", "") or "").strip().lower()
     pf.alignment = ALIGNMENT_MAP.get(align_key, WD_ALIGN_PARAGRAPH.CENTER)
-    pf.space_before = Pt(sc.space_before_pt)
-    pf.space_after = Pt(sc.space_after_pt)
+    apply_style_paragraph_spacing(pf, sc)
     apply_line_spacing(pf, sc.line_spacing_type, sc.line_spacing_pt)
-    sync_spacing_ooxml(
-        para._element,
-        space_before_pt=sc.space_before_pt,
-        space_after_pt=sc.space_after_pt,
-        line_spacing_type=sc.line_spacing_type,
-        line_spacing_value=sc.line_spacing_pt,
-    )
+    sync_style_spacing_ooxml(para._element, sc)
     apply_style_config_indents(pf, para._element, sc)
     _sync_caption_indent_ooxml(para, sc)
     for run in para.runs:

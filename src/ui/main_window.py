@@ -63,6 +63,11 @@ from src.ui.line_spacing_options import (
     normalize_line_spacing_type,
     resolve_line_spacing_value,
 )
+from src.utils.line_spacing import (
+    normalize_paragraph_spacing_unit,
+    normalize_paragraph_spacing_value,
+    paragraph_spacing_value_to_pt,
+)
 from src.ui.font_sizes import (
     NUMERIC_FONT_SIZE_OPTIONS,
     WORD_NAMED_FONT_SIZES,
@@ -852,6 +857,148 @@ class LineSpacingValueWidget(QWidget):
         self.spacingTypeChanged.emit(self._active_kind)
 
 
+class ParagraphSpacingValueWidget(QWidget):
+    """Paragraph before/after spacing editor with Word-compatible units."""
+
+    valueChanged = Signal(str)
+    unitChanged = Signal(str)
+    _UNIT_ORDER = ("pt", "in", "cm", "mm", "line", "auto")
+    _UNIT_LABELS = {
+        "pt": "磅",
+        "in": "英寸",
+        "cm": "厘米",
+        "mm": "毫米",
+        "line": "行",
+        "auto": "自动",
+    }
+
+    def __init__(self, value, unit: str = "pt", parent=None, *, is_placeholder: bool = False):
+        super().__init__(parent)
+        self._active_unit = normalize_paragraph_spacing_unit(unit)
+        self._is_placeholder = bool(is_placeholder)
+        self._last_values = {
+            "pt": 0.0,
+            "in": 0.0,
+            "cm": 0.0,
+            "mm": 0.0,
+            "line": 0.0,
+        }
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 2, 0)
+        layout.setSpacing(2)
+
+        self._edit = QLineEdit(self)
+        self._edit.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._edit.setFixedWidth(42)
+        self._edit.setFixedHeight(24)
+        self._edit.textChanged.connect(self._on_text_changed)
+        self._edit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        self._unit_button = QPushButton(self)
+        self._unit_button.setCursor(Qt.PointingHandCursor)
+        self._unit_button.setFixedSize(42, 24)
+        self._unit_button.setFocusPolicy(Qt.NoFocus)
+        self._unit_button.clicked.connect(self._toggle_unit)
+
+        layout.addWidget(self._edit)
+        layout.addWidget(self._unit_button)
+        self.setFixedHeight(24)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        self.setConfigValue(value, unit=self._active_unit)
+
+    def text(self) -> str:
+        return self._edit.text().strip()
+
+    def unit(self) -> str:
+        return self._active_unit
+
+    def configValue(self) -> float:
+        if self._active_unit == "auto":
+            return 0.0
+        text = self.text()
+        if not text:
+            return 0.0
+        try:
+            return max(0.0, float(text))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid paragraph spacing value") from exc
+
+    def displayText(self) -> str:
+        unit_label = self._UNIT_LABELS.get(self._active_unit, "磅")
+        if self._active_unit == "auto":
+            return unit_label
+        value = self.configValue()
+        return f"{format_font_size_pt(value)}{unit_label}"
+
+    def setConfigValue(self, value, *, unit: str | None = None) -> None:
+        if unit is not None:
+            self._active_unit = normalize_paragraph_spacing_unit(unit)
+        if self._active_unit != "auto":
+            numeric = normalize_paragraph_spacing_value(value)
+            self._last_values[self._active_unit] = numeric
+        self._refresh_text()
+
+    def _refresh_text(self) -> None:
+        was_blocked = self._edit.blockSignals(True)
+        if self._active_unit == "auto":
+            self._edit.setText("")
+            self._edit.setEnabled(False)
+        else:
+            self._edit.setEnabled(True)
+            value = self._last_values.get(self._active_unit, 0.0)
+            self._edit.setText(format_font_size_pt(value) if value > 0 else "")
+        self._edit.blockSignals(was_blocked)
+        self._refresh_chrome()
+
+    def _refresh_chrome(self) -> None:
+        label = self._UNIT_LABELS.get(self._active_unit, "磅")
+        self._unit_button.setText(label)
+        self._unit_button.setToolTip(f"点击切换单位：当前为{label}")
+        self._edit.setToolTip(f"当前单位：{label}")
+        text_color = "#9ca3af" if self._is_placeholder else "#111111"
+        button_width = 48 if self._active_unit in {"auto", "line"} else 42
+        self._unit_button.setFixedWidth(button_width)
+        self._unit_button.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: #f3f4f6;
+                border: 1px solid #d1d5db;
+                border-radius: 4px;
+                padding: 0 3px;
+                color: {text_color};
+                font-weight: 600;
+            }}
+            QPushButton:pressed {{
+                background-color: #e5e7eb;
+            }}
+            """
+        )
+
+    def _on_text_changed(self, _text: str) -> None:
+        if self._active_unit != "auto":
+            try:
+                self._last_values[self._active_unit] = max(0.0, float(self.text()))
+            except (TypeError, ValueError):
+                pass
+        self.valueChanged.emit(self.text())
+
+    def _toggle_unit(self) -> None:
+        if self._active_unit != "auto":
+            try:
+                self._last_values[self._active_unit] = max(0.0, float(self.text() or 0.0))
+            except (TypeError, ValueError):
+                pass
+        try:
+            idx = self._UNIT_ORDER.index(self._active_unit)
+        except ValueError:
+            idx = 0
+        self._active_unit = self._UNIT_ORDER[(idx + 1) % len(self._UNIT_ORDER)]
+        self._refresh_text()
+        self.unitChanged.emit(self._active_unit)
+
+
 class FontSearchFilterProxyModel(QSortFilterProxyModel):
     """Filter installed fonts with case-insensitive fuzzy matching."""
 
@@ -1413,8 +1560,8 @@ _STYLE_COLUMNS = [
     ("left_indent_chars", "左缩进", "float"),
     ("right_indent_chars", "右缩进", "float"),
     ("line_spacing_pt", "行距", "float"),
-    ("space_before_pt", "段前(磅)", "float"),
-    ("space_after_pt", "段后(磅)", "float"),
+    ("space_before_pt", "段前", "float"),
+    ("space_after_pt", "段后", "float"),
 ]
 
 _STYLE_PREVIEW_COLUMNS: tuple[tuple[str, str], ...] = ()
@@ -1597,8 +1744,8 @@ class FormatConfigDialog(QDialog):
         "left_indent_chars": 88,
         "right_indent_chars": 88,
         "line_spacing_pt": 96,
-        "space_before_pt": 56,
-        "space_after_pt": 56,
+        "space_before_pt": 96,
+        "space_after_pt": 96,
     }
     _STYLE_TABLE_ROW_HEIGHT = 32
     _STYLE_TABLE_MIN_ROW_HEADER_WIDTH = 80
@@ -1960,6 +2107,8 @@ class FormatConfigDialog(QDialog):
         for row, key in enumerate(style_keys):
             sc = self._config.styles[key]
             sync_style_config_indent_fields(sc)
+            from src.utils.line_spacing import sync_style_config_spacing_fields
+            sync_style_config_spacing_fields(sc)
             is_placeholder = key in backfilled
             header_item = QTableWidgetItem(_STYLE_DISPLAY_NAMES.get(key, key))
             if is_placeholder:
@@ -1994,6 +2143,22 @@ class FormatConfigDialog(QDialog):
                         )
                         widget.spacingTypeChanged.connect(
                             lambda _kind, row=row: self._update_style_row_header_visual(row)
+                        )
+                    self._style_table.setCellWidget(row, table_col, self._wrap_style_cell_widget(widget))
+                    continue
+                if attr in {"space_before_pt", "space_after_pt"}:
+                    prefix = "space_before" if attr == "space_before_pt" else "space_after"
+                    widget = self._build_paragraph_spacing_value_widget(
+                        getattr(sc, f"{prefix}_value", getattr(sc, attr, 0.0)),
+                        getattr(sc, f"{prefix}_unit", "pt"),
+                        is_placeholder=is_placeholder,
+                    )
+                    if isinstance(widget, ParagraphSpacingValueWidget):
+                        widget.valueChanged.connect(
+                            lambda _text, row=row: self._update_style_row_header_visual(row)
+                        )
+                        widget.unitChanged.connect(
+                            lambda _unit, row=row: self._update_style_row_header_visual(row)
                         )
                     self._style_table.setCellWidget(row, table_col, self._wrap_style_cell_widget(widget))
                     continue
@@ -2282,6 +2447,14 @@ class FormatConfigDialog(QDialog):
             is_placeholder=is_placeholder,
         )
 
+    def _build_paragraph_spacing_value_widget(self, value, unit, *, is_placeholder: bool = False) -> QWidget:
+        return ParagraphSpacingValueWidget(
+            value,
+            unit,
+            self._style_table,
+            is_placeholder=is_placeholder,
+        )
+
     def _build_special_indent_widget(
         self,
         mode,
@@ -2381,12 +2554,25 @@ class FormatConfigDialog(QDialog):
             return widget.text()
         if isinstance(widget, IndentValueWidget):
             return widget.text()
+        if isinstance(widget, ParagraphSpacingValueWidget):
+            return widget.text()
         if isinstance(widget, LineSpacingValueWidget):
             return widget.text()
         item = self._style_table.item(row, col)
         if not item:
             return ""
         return item.text().strip()
+
+    def _style_paragraph_spacing_display(self, row: int, attr_name: str) -> str:
+        col = self._style_table_col_index(attr_name)
+        widget = self._style_cell_widget(row, col)
+        if isinstance(widget, ParagraphSpacingValueWidget):
+            try:
+                return widget.displayText()
+            except (ValueError, TypeError):
+                return widget.text()
+        text = self._style_text_value(row, attr_name)
+        return f"{text}磅" if text else "0磅"
 
     def _update_indent_value_widgets(self, row: int) -> None:
         size_pt = self._style_size_value(row)
@@ -2527,7 +2713,9 @@ class FormatConfigDialog(QDialog):
             f"斜体: {'开启' if self._style_bool_value(row, 'italic') else '关闭'}\n"
             f"对齐: {alignment}\n"
             f"行距: {line_spacing_display_label(line_spacing_type)} "
-            f"{format_font_size_pt(line_spacing_value)}{line_spacing_unit_label(line_spacing_type)}"
+            f"{format_font_size_pt(line_spacing_value)}{line_spacing_unit_label(line_spacing_type)}\n"
+            f"段前: {self._style_paragraph_spacing_display(row, 'space_before_pt')}\n"
+            f"段后: {self._style_paragraph_spacing_display(row, 'space_after_pt')}"
         )
 
     def _style_size_value(self, row: int) -> float | None:
@@ -4456,28 +4644,26 @@ class FormatConfigDialog(QDialog):
             float(getattr(formula_table_cfg, "formula_line_spacing", 1.0))
         )
 
-        self._formula_table_space_before_spin = ScrollSafeDoubleSpinBox()
-        self._formula_table_space_before_spin.setRange(0.0, 24.0)
-        self._formula_table_space_before_spin.setSingleStep(0.5)
-        self._formula_table_space_before_spin.setDecimals(1)
-        self._formula_table_space_before_spin.setFixedWidth(88)
-        self._formula_table_space_before_spin.setValue(
-            float(getattr(formula_table_cfg, "formula_space_before_pt", 0.0))
+        formula_before_value = getattr(formula_table_cfg, "formula_space_before_value", None)
+        if formula_before_value is None:
+            formula_before_value = getattr(formula_table_cfg, "formula_space_before_pt", 0.0)
+        self._formula_table_space_before_spin = ParagraphSpacingValueWidget(
+            formula_before_value,
+            getattr(formula_table_cfg, "formula_space_before_unit", "pt"),
         )
 
-        self._formula_table_space_after_spin = ScrollSafeDoubleSpinBox()
-        self._formula_table_space_after_spin.setRange(0.0, 24.0)
-        self._formula_table_space_after_spin.setSingleStep(0.5)
-        self._formula_table_space_after_spin.setDecimals(1)
-        self._formula_table_space_after_spin.setFixedWidth(88)
-        self._formula_table_space_after_spin.setValue(
-            float(getattr(formula_table_cfg, "formula_space_after_pt", 0.0))
+        formula_after_value = getattr(formula_table_cfg, "formula_space_after_value", None)
+        if formula_after_value is None:
+            formula_after_value = getattr(formula_table_cfg, "formula_space_after_pt", 0.0)
+        self._formula_table_space_after_spin = ParagraphSpacingValueWidget(
+            formula_after_value,
+            getattr(formula_table_cfg, "formula_space_after_unit", "pt"),
         )
         formula_layout.addWidget(
             self._build_compact_option_row(
                 ("公式行距(倍):", self._formula_table_line_spacing_spin),
-                ("段前(磅):", self._formula_table_space_before_spin),
-                ("段后(磅):", self._formula_table_space_after_spin),
+                ("段前:", self._formula_table_space_before_spin),
+                ("段后:", self._formula_table_space_after_spin),
             )
         )
 
@@ -4557,8 +4743,8 @@ class FormatConfigDialog(QDialog):
         ]:
             spin = ScrollSafeDoubleSpinBox()
             spin.setRange(0, 20)
-            spin.setDecimals(1)
-            spin.setSingleStep(0.1)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.01)
             spin.setValue(val)
             self._page_spins[attr] = spin
             layout.addRow(label + ":", spin)
@@ -4656,6 +4842,7 @@ class FormatConfigDialog(QDialog):
         invalid_font_size_cells = []
         invalid_indent_cells = []
         invalid_line_spacing_cells = []
+        invalid_paragraph_spacing_cells = []
         invalid_numbering_template_cells = []
         # 样式
         for row, key in enumerate(self._style_keys):
@@ -4719,6 +4906,28 @@ class FormatConfigDialog(QDialog):
                                 sc.right_indent_unit = widget.unit()
                         except (ValueError, TypeError):
                             invalid_indent_cells.append(
+                                f"{_STYLE_DISPLAY_NAMES.get(key, key)} / {_STYLE_COLUMNS[col][1]} = {widget.text()}"
+                            )
+                        continue
+                    item = self._style_table.item(row, table_col)
+                    if not item:
+                        continue
+                    text = item.text().strip()
+                elif attr in {"space_before_pt", "space_after_pt"}:
+                    widget = self._style_cell_widget(row, table_col)
+                    if isinstance(widget, ParagraphSpacingValueWidget):
+                        try:
+                            value = widget.configValue()
+                            unit = widget.unit()
+                            prefix = "space_before" if attr == "space_before_pt" else "space_after"
+                            setattr(sc, f"{prefix}_value", value)
+                            setattr(sc, f"{prefix}_unit", unit)
+                            if unit in {"pt", "in", "cm", "mm"}:
+                                setattr(sc, attr, paragraph_spacing_value_to_pt(value, unit))
+                            else:
+                                setattr(sc, attr, 0.0)
+                        except (ValueError, TypeError):
+                            invalid_paragraph_spacing_cells.append(
                                 f"{_STYLE_DISPLAY_NAMES.get(key, key)} / {_STYLE_COLUMNS[col][1]} = {widget.text()}"
                             )
                         continue
@@ -4846,8 +5055,32 @@ class FormatConfigDialog(QDialog):
             except (ValueError, TypeError):
                 invalid_font_size_cells.append(f"公式表格 / 公式字号 = {formula_font_size_text}")
             formula_table_cfg.formula_line_spacing = self._formula_table_line_spacing_spin.value()
-            formula_table_cfg.formula_space_before_pt = self._formula_table_space_before_spin.value()
-            formula_table_cfg.formula_space_after_pt = self._formula_table_space_after_spin.value()
+            try:
+                before_value = self._formula_table_space_before_spin.configValue()
+                before_unit = self._formula_table_space_before_spin.unit()
+                formula_table_cfg.formula_space_before_value = before_value
+                formula_table_cfg.formula_space_before_unit = before_unit
+                if before_unit in {"pt", "in", "cm", "mm"}:
+                    formula_table_cfg.formula_space_before_pt = paragraph_spacing_value_to_pt(before_value, before_unit)
+                else:
+                    formula_table_cfg.formula_space_before_pt = 0.0
+            except (ValueError, TypeError):
+                invalid_paragraph_spacing_cells.append(
+                    f"公式表格 / 段前 = {self._formula_table_space_before_spin.text()}"
+                )
+            try:
+                after_value = self._formula_table_space_after_spin.configValue()
+                after_unit = self._formula_table_space_after_spin.unit()
+                formula_table_cfg.formula_space_after_value = after_value
+                formula_table_cfg.formula_space_after_unit = after_unit
+                if after_unit in {"pt", "in", "cm", "mm"}:
+                    formula_table_cfg.formula_space_after_pt = paragraph_spacing_value_to_pt(after_value, after_unit)
+                else:
+                    formula_table_cfg.formula_space_after_pt = 0.0
+            except (ValueError, TypeError):
+                invalid_paragraph_spacing_cells.append(
+                    f"公式表格 / 段后 = {self._formula_table_space_after_spin.text()}"
+                )
             formula_table_cfg.block_alignment = normalize_alignment_value(
                 self._formula_table_block_alignment_combo.currentData() or "center"
             )
@@ -4909,6 +5142,7 @@ class FormatConfigDialog(QDialog):
             + invalid_font_size_cells
             + invalid_indent_cells
             + invalid_line_spacing_cells
+            + invalid_paragraph_spacing_cells
             + invalid_numbering_template_cells
         )
         if invalid_cells:
@@ -4922,6 +5156,8 @@ class FormatConfigDialog(QDialog):
                 tips.append("缩进值必须是有效数字；单位可选字或磅。")
             if invalid_line_spacing_cells:
                 tips.append("行距值必须是有效数字；固定值使用磅，多倍行距使用倍数。")
+            if invalid_paragraph_spacing_cells:
+                tips.append("段前/段后值必须是有效数字；自动单位不需要填写数值。")
             if invalid_bool_cells:
                 tips.append("布尔值可用值示例: true/false, 1/0, yes/no。")
             if invalid_numbering_template_cells:

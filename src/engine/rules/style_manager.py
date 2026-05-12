@@ -10,7 +10,7 @@ from src.engine.change_tracker import ChangeTracker
 from src.scene.schema import SceneConfig, StyleConfig
 from src.scene.heading_model import get_level_to_style_key, get_level_to_word_style
 from src.utils.indent import apply_style_config_indents
-from src.utils.line_spacing import apply_line_spacing, sync_spacing_ooxml
+from src.utils.line_spacing import apply_line_spacing, apply_style_paragraph_spacing, sync_style_spacing_ooxml
 from src.utils.ooxml import apply_explicit_rfonts
 
 ALIGNMENT_MAP = {
@@ -153,17 +153,10 @@ def _apply_style_config(style, sc: StyleConfig) -> None:
     pf = style.paragraph_format
     if sc.alignment in ALIGNMENT_MAP:
         pf.alignment = ALIGNMENT_MAP[sc.alignment]
-    pf.space_before = Pt(sc.space_before_pt)
-    pf.space_after = Pt(sc.space_after_pt)
+    apply_style_paragraph_spacing(pf, sc)
 
     apply_line_spacing(pf, sc.line_spacing_type, sc.line_spacing_pt)
-    sync_spacing_ooxml(
-        style.element,
-        space_before_pt=sc.space_before_pt,
-        space_after_pt=sc.space_after_pt,
-        line_spacing_type=sc.line_spacing_type,
-        line_spacing_value=sc.line_spacing_pt,
-    )
+    sync_style_spacing_ooxml(style.element, sc)
 
     apply_style_config_indents(pf, style.element, sc)
 

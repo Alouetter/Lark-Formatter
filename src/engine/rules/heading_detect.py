@@ -17,6 +17,7 @@ from src.scene.heading_model import (
     get_post_section_types,
 )
 from src.scene.schema import HeadingRiskGuardConfig, SceneConfig
+from src.utils.docx_heading_semantics import get_paragraph_outline_level, get_paragraph_numpr, remove_paragraph_outline_level
 from src.utils.toc_entry import (
     looks_like_toc_entry_line,
     looks_like_reference_entry_line,
@@ -282,8 +283,28 @@ def _detect_by_pattern(text: str) -> str | None:
     return None
 
 
+def _detect_by_outline(para: Paragraph, text: str) -> tuple[str | None, int | None]:
+    outline_level = get_paragraph_outline_level(para)
+    if outline_level is None:
+        return None, None
+    if len(text) < 4 or len(text) > 80:
+        return None, outline_level
+    if outline_level == 0:
+        return "heading1", outline_level
+    if outline_level == 1:
+        return "heading2", outline_level
+    if outline_level == 2:
+        return "heading3", outline_level
+    if outline_level == 3:
+        return "heading4", outline_level
+    return None, outline_level
+
+
 def _detect_heading_level(para: Paragraph, text: str, config: SceneConfig) -> str | None:
     level = _detect_by_style(para, config)
+    if level:
+        return level
+    level, _ = _detect_by_outline(para, text)
     if level:
         return level
     return _detect_by_pattern(text)
@@ -293,13 +314,16 @@ def _heading_confidence_score(
         para: Paragraph,
         text: str,
         style_level: str | None,
-        pattern_level: str | None) -> int:
+        pattern_level: str | None,
+        outline_level: int | None = None) -> int:
     """Whitelist/blacklist confidence score for heading candidate acceptance."""
     score = 0
 
     # Whitelist signals.
     if style_level:
         score += 3
+    elif outline_level is not None:
+        score += 2
     elif pattern_level:
         score += 2
     if len(text) <= 80:
@@ -334,7 +358,9 @@ def _scan_heading_candidates(
         config: SceneConfig,
         non_numbered_title_norms: set[str],
         front_title_norms: set[str],
-        confidence: str = "high") -> list[HeadingInfo]:
+        confidence: str = "high",
+        *,
+        allow_outline: bool = False) -> list[HeadingInfo]:
     found: list[HeadingInfo] = []
     for i in sorted(allowed_indices):
         if i < 0 or i >= len(doc.paragraphs):
@@ -369,10 +395,20 @@ def _scan_heading_candidates(
             continue
 
         style_level = _detect_by_style(para, config)
-        pattern_level = _detect_by_pattern(text) if not style_level else None
-        level = style_level or pattern_level
+        outline_level = None
+        outline_heading_level = None
+        if allow_outline and not style_level:
+            outline_heading_level, outline_level = _detect_by_outline(para, text)
+        pattern_level = _detect_by_pattern(text) if not style_level and not outline_heading_level else None
+        level = style_level or outline_heading_level or pattern_level
         if level:
-            conf_score = _heading_confidence_score(para, text, style_level, pattern_level)
+            conf_score = _heading_confidence_score(
+                para,
+                text,
+                style_level,
+                pattern_level,
+                outline_level=outline_level if outline_heading_level else None,
+            )
             if conf_score >= _HEADING_MIN_CONF_SCORE:
                 found.append(HeadingInfo(i, level, text, confidence))
     return found
@@ -479,6 +515,7 @@ def _scan_toc_overreach_candidates(
         non_numbered_title_norms,
         front_title_norms,
         confidence="low",
+        allow_outline=True,
     )
 
 
@@ -489,6 +526,10 @@ class HeadingDetectRule(BaseRule):
     def apply(self, doc: Document, config: SceneConfig, tracker: ChangeTracker, context: dict) -> None:
         doc_tree: DocTree = context.get("doc_tree")
         body = doc_tree.get_section("body") if doc_tree else None
+
+        # Sanitize invalid outlineLvl before heading scan.
+        self._sanitize_outline_levels(doc, doc_tree, config, tracker)
+
         headings: list[HeadingInfo] = []
         total = len(doc.paragraphs)
         guard = config.heading_numbering.risk_guard
@@ -539,7 +580,13 @@ class HeadingDetectRule(BaseRule):
 
         # Default path: only detect inside body section (high confidence).
         primary_headings = _scan_heading_candidates(
-            doc, body_indices, config, non_numbered_title_norms, front_title_norms, confidence="high"
+            doc,
+            body_indices,
+            config,
+            non_numbered_title_norms,
+            front_title_norms,
+            confidence="high",
+            allow_outline=True,
         )
         headings = list(primary_headings)
 
@@ -603,4 +650,49 @@ class HeadingDetectRule(BaseRule):
                 before=h.text[:50],
                 after=f"识别为 {h.level} (置信度: {h.confidence})",
                 paragraph_index=h.para_index,
+            )
+
+    def _sanitize_outline_levels(
+            self, doc: Document, doc_tree, config: SceneConfig, tracker: ChangeTracker) -> None:
+        """清除空白段落和参考文献正文的非法 outlineLvl。"""
+        if not doc_tree:
+            return
+        body = doc_tree.get_section("body")
+        ref_section = doc_tree.get_section("references")
+        front_title_norms = get_front_matter_title_norms(config)
+
+        cleaned = 0
+        for i, p in enumerate(doc.paragraphs):
+            outline = get_paragraph_outline_level(p)
+            if outline is None:
+                continue
+            text = (p.text or "").strip()
+
+            # Rule 1: empty paragraphs with outlineLvl
+            if not text:
+                if remove_paragraph_outline_level(p):
+                    cleaned += 1
+                continue
+
+            # Rule 2: reference entries (exclude the section title itself)
+            if ref_section and ref_section.start_index < i <= ref_section.end_index:
+                if remove_paragraph_outline_level(p):
+                    cleaned += 1
+                continue
+
+            # Rule 3: paragraphs before body that are not front-matter titles
+            if body and i < body.start_index:
+                if not _is_front_matter_title(text, front_title_norms):
+                    if remove_paragraph_outline_level(p):
+                        cleaned += 1
+
+        if cleaned:
+            tracker.record(
+                rule_name=self.name,
+                target=f"{cleaned} 个段落",
+                section="global",
+                change_type="cleanup",
+                before="outlineLvl 脏数据",
+                after=f"已清除 {cleaned} 个非法 outlineLvl",
+                paragraph_index=-1,
             )

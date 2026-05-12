@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from docx import Document
 from docx.text.paragraph import Paragraph
 from docx.shared import Pt
+from src.utils.docx_heading_semantics import get_paragraph_outline_level
 from src.utils.toc_entry import (
     looks_like_toc_entry_line,
     looks_like_date_placeholder_line,
@@ -15,7 +16,7 @@ from src.utils.toc_entry import (
 
 # 分区锚点关键字
 SECTION_ANCHORS: dict[str, list[str]] = {
-    "cover": ["学位论文", "博士学位", "硕士学位"],
+    "cover": ["学位论文", "博士学位", "硕士学位", "本科毕业论文", "毕业论文", "本科毕业设计", "毕业设计"],
     "abstract_cn": ["摘要", "摘 要"],
     "abstract_en": ["Abstract", "ABSTRACT"],
     "toc": ["目录", "目 录"],
@@ -87,6 +88,8 @@ _FRONT_TITLE_NORMS = {
     "tableofcontents",
 }
 _RE_FRONT_TITLE_TAIL_MARKS = re.compile(r"[：:;；·•\-—_~\.。…]+$")
+_RE_INLINE_ABSTRACT_CN = re.compile(r"^\s*摘要\s*[：:]\s*\S")
+_RE_INLINE_ABSTRACT_EN = re.compile(r"^\s*abstract\s*[：:]\s*\S", re.IGNORECASE)
 _RE_FRONT_TITLE_PATTERNS = [
     re.compile(r"^\u6458\u8981(?:[（(][^()（）]{0,8}[)）])?$"),
     re.compile(r"^abstract(?:[（(][^()（）]{0,16}[)）])?$", re.IGNORECASE),
@@ -221,12 +224,23 @@ def _score_paragraph(para: Paragraph, sec_type: str,
       - 位置加分（符合预期位置区间）: +2
     """
     text = para.text.strip()
-    if not text or len(text) > 80:
+    if not text:
         return 0.0
     if sec_type != "toc" and (
         looks_like_toc_entry_line(text)
         or looks_like_numbered_toc_entry_with_page_suffix(text)
     ):
+        return 0.0
+
+    if sec_type == "abstract_cn":
+        ratio = para_index / max(total, 1)
+        if ratio < 0.35 and len(text) > 20 and _RE_INLINE_ABSTRACT_CN.match(text):
+            return 9.0
+    if sec_type == "abstract_en":
+        ratio = para_index / max(total, 1)
+        if ratio < 0.45 and len(text) > 20 and _RE_INLINE_ABSTRACT_EN.match(text):
+            return 9.0
+    if len(text) > 80:
         return 0.0
 
     score = 0.0
@@ -905,6 +919,17 @@ class DocTree:
                 if pat.match(text):
                     self._detection_log.append(
                         f"body 扫描: 模式匹配，"
+                        f"段落 #{idx} ({text[:30]})")
+                    return idx
+
+            # Only use outline-level hints once body scanning has moved past
+            # the document head; this avoids trusting cover/comment blocks
+            # before pre-body recovery has had a chance to narrow the range.
+            outline_level = get_paragraph_outline_level(p)
+            if start > 0 and outline_level in (0, 1) and 4 <= len(text) <= 80:
+                if text[-1:] not in {"：", ":", "；", ";", "。", "!", "！", "?", "？"}:
+                    self._detection_log.append(
+                        f"body 扫描: outlineLvl={outline_level}，"
                         f"段落 #{idx} ({text[:30]})")
                     return idx
 

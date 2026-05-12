@@ -20,7 +20,7 @@ from src.scene.heading_model import (
 )
 from src.scene.schema import SceneConfig, StyleConfig
 from src.utils.indent import style_config_indent_kwargs, sync_indent_ooxml
-from src.utils.line_spacing import normalize_line_spacing, sync_spacing_ooxml
+from src.utils.line_spacing import normalize_line_spacing, sync_style_spacing_ooxml
 from src.utils.ooxml import apply_explicit_rfonts
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -106,21 +106,14 @@ def _apply_para_style(p_el, sc: StyleConfig, *, default_alignment: str = "center
         getattr(sc, "line_spacing_pt", 20.0),
     )
     if resolved is None:
-        sync_spacing_ooxml(
+        sync_style_spacing_ooxml(
             p_el,
-            space_before_pt=getattr(sc, "space_before_pt", 0.0),
-            space_after_pt=getattr(sc, "space_after_pt", 0.0),
+            sc,
             line_spacing_type="single",
             line_spacing_value=1.0,
         )
         return
-    sync_spacing_ooxml(
-        p_el,
-        space_before_pt=getattr(sc, "space_before_pt", 0.0),
-        space_after_pt=getattr(sc, "space_after_pt", 0.0),
-        line_spacing_type=getattr(sc, "line_spacing_type", "exact"),
-        line_spacing_value=getattr(sc, "line_spacing_pt", 20.0),
-    )
+    sync_style_spacing_ooxml(p_el, sc)
 
 
 def _apply_part_style(element, sc: StyleConfig, *, default_alignment: str = "center") -> None:

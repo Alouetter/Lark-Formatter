@@ -26,7 +26,12 @@ from src.formula_core.semantics import (
     UPRIGHT_FAMILY_MARKER_COMMANDS,
 )
 from src.scene.schema import SceneConfig
-from src.utils.line_spacing import sync_spacing_ooxml
+from src.utils.line_spacing import (
+    normalize_paragraph_spacing_unit,
+    normalize_paragraph_spacing_value,
+    paragraph_spacing_value_to_pt,
+    sync_spacing_ooxml,
+)
 from src.utils.ooxml import apply_explicit_rfonts
 
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -81,18 +86,36 @@ def _apply_paragraph_layout(
         line_spacing: float,
         space_before_pt: float,
         space_after_pt: float,
+        space_before_value=None,
+        space_before_unit: str = "pt",
+        space_after_value=None,
+        space_after_unit: str = "pt",
         block_alignment: str) -> bool:
     changed = False
     if unify_spacing:
         pf = para.paragraph_format
-        before_value = Pt(space_before_pt)
-        after_value = Pt(space_after_pt)
-        if pf.space_before != before_value:
-            pf.space_before = before_value
-            changed = True
-        if pf.space_after != after_value:
-            pf.space_after = after_value
-            changed = True
+        before_unit = normalize_paragraph_spacing_unit(space_before_unit)
+        after_unit = normalize_paragraph_spacing_unit(space_after_unit)
+        if before_unit in {"pt", "in", "cm", "mm"}:
+            before_value = Pt(paragraph_spacing_value_to_pt(
+                normalize_paragraph_spacing_value(
+                    space_before_value if space_before_value is not None else space_before_pt
+                ),
+                before_unit,
+            ))
+            if pf.space_before != before_value:
+                pf.space_before = before_value
+                changed = True
+        if after_unit in {"pt", "in", "cm", "mm"}:
+            after_value = Pt(paragraph_spacing_value_to_pt(
+                normalize_paragraph_spacing_value(
+                    space_after_value if space_after_value is not None else space_after_pt
+                ),
+                after_unit,
+            ))
+            if pf.space_after != after_value:
+                pf.space_after = after_value
+                changed = True
         if pf.line_spacing != line_spacing:
             pf.line_spacing = line_spacing
             changed = True
@@ -100,6 +123,10 @@ def _apply_paragraph_layout(
             para._element,
             space_before_pt=space_before_pt,
             space_after_pt=space_after_pt,
+            space_before_value=space_before_value,
+            space_before_unit=space_before_unit,
+            space_after_value=space_after_value,
+            space_after_unit=space_after_unit,
             line_spacing_type="multiple",
             line_spacing_value=line_spacing,
         )
@@ -777,6 +804,10 @@ def _apply_formula_paragraph_style(
         line_spacing: float,
         space_before_pt: float,
         space_after_pt: float,
+        space_before_value=None,
+        space_before_unit: str = "pt",
+        space_after_value=None,
+        space_after_unit: str = "pt",
         block_alignment: str) -> bool:
     para_has_omml = _paragraph_has_omml(para)
     changed = False
@@ -788,6 +819,10 @@ def _apply_formula_paragraph_style(
             line_spacing=line_spacing,
             space_before_pt=space_before_pt,
             space_after_pt=space_after_pt,
+            space_before_value=space_before_value,
+            space_before_unit=space_before_unit,
+            space_after_value=space_after_value,
+            space_after_unit=space_after_unit,
             block_alignment=block_alignment,
         )
         changed |= _apply_run_style(
@@ -860,6 +895,10 @@ def _style_formula_table_cells(
         line_spacing: float,
         space_before_pt: float,
         space_after_pt: float,
+        space_before_value=None,
+        space_before_unit: str = "pt",
+        space_after_value=None,
+        space_after_unit: str = "pt",
         block_alignment: str,
         already_styled_paragraph_ids: set[str] | None = None) -> dict[str, int]:
     """Apply style only to formula cells in equation tables."""
@@ -898,6 +937,10 @@ def _style_formula_table_cells(
             line_spacing=line_spacing,
             space_before_pt=space_before_pt,
             space_after_pt=space_after_pt,
+            space_before_value=space_before_value,
+            space_before_unit=space_before_unit,
+            space_after_value=space_after_value,
+            space_after_unit=space_after_unit,
             block_alignment=block_alignment,
         )
         if not cell_changed:
@@ -1022,19 +1065,41 @@ class FormulaStyleRule(BaseRule):
             getattr(formula_table_cfg, "formula_line_spacing", 1.0),
             1.0,
         )
+        space_before_unit = normalize_paragraph_spacing_unit(
+            getattr(formula_table_cfg, "formula_space_before_unit", "pt")
+        )
+        space_after_unit = normalize_paragraph_spacing_unit(
+            getattr(formula_table_cfg, "formula_space_after_unit", "pt")
+        )
         try:
+            default_before_pt = float(getattr(formula_table_cfg, "formula_space_before_pt", 0.0) or 0.0)
+            raw_before_value = getattr(formula_table_cfg, "formula_space_before_value", None)
+            if raw_before_value is None:
+                raw_before_value = default_before_pt if space_before_unit not in {"line", "auto"} else 0.0
+            space_before_value = normalize_paragraph_spacing_value(raw_before_value)
             space_before_pt = max(
                 0.0,
-                float(getattr(formula_table_cfg, "formula_space_before_pt", 0.0) or 0.0),
+                paragraph_spacing_value_to_pt(space_before_value, space_before_unit)
+                if space_before_unit in {"pt", "in", "cm", "mm"}
+                else default_before_pt,
             )
         except (TypeError, ValueError):
+            space_before_value = 0.0
             space_before_pt = 0.0
         try:
+            default_after_pt = float(getattr(formula_table_cfg, "formula_space_after_pt", 0.0) or 0.0)
+            raw_after_value = getattr(formula_table_cfg, "formula_space_after_value", None)
+            if raw_after_value is None:
+                raw_after_value = default_after_pt if space_after_unit not in {"line", "auto"} else 0.0
+            space_after_value = normalize_paragraph_spacing_value(raw_after_value)
             space_after_pt = max(
                 0.0,
-                float(getattr(formula_table_cfg, "formula_space_after_pt", 0.0) or 0.0),
+                paragraph_spacing_value_to_pt(space_after_value, space_after_unit)
+                if space_after_unit in {"pt", "in", "cm", "mm"}
+                else default_after_pt,
             )
         except (TypeError, ValueError):
+            space_after_value = 0.0
             space_after_pt = 0.0
         block_alignment = _normalized_alignment(
             getattr(formula_table_cfg, "block_alignment", "center"),
@@ -1141,6 +1206,10 @@ class FormulaStyleRule(BaseRule):
                         line_spacing=line_spacing,
                         space_before_pt=space_before_pt,
                         space_after_pt=space_after_pt,
+                        space_before_value=space_before_value,
+                        space_before_unit=space_before_unit,
+                        space_after_value=space_after_value,
+                        space_after_unit=space_after_unit,
                         block_alignment=block_alignment,
                     )
                     if changed:
@@ -1195,6 +1264,10 @@ class FormulaStyleRule(BaseRule):
                 line_spacing=line_spacing,
                 space_before_pt=space_before_pt,
                 space_after_pt=space_after_pt,
+                space_before_value=space_before_value,
+                space_before_unit=space_before_unit,
+                space_after_value=space_after_value,
+                space_after_unit=space_after_unit,
                 block_alignment=block_alignment,
             )
 
@@ -1275,6 +1348,10 @@ class FormulaStyleRule(BaseRule):
             line_spacing=line_spacing,
             space_before_pt=space_before_pt,
             space_after_pt=space_after_pt,
+            space_before_value=space_before_value,
+            space_before_unit=space_before_unit,
+            space_after_value=space_after_value,
+            space_after_unit=space_after_unit,
             block_alignment=block_alignment,
             already_styled_paragraph_ids=pre_styled_equation_table_paragraph_ids,
         )

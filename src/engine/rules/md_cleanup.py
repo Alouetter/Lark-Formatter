@@ -71,6 +71,16 @@ class MdCleanupRule(BaseRule):
     name = "md_cleanup"
     description = "检测并转换 Markdown 语法"
 
+    @staticmethod
+    def _ref_skip_ranges(doc_tree) -> list[tuple[int, int]]:
+        """Return skip ranges covering the reference section (if any)."""
+        if not doc_tree:
+            return []
+        ref = doc_tree.get_section("references")
+        if ref is None:
+            return []
+        return [(ref.start_index, ref.end_index)]
+
     def apply(self, doc: Document, config: SceneConfig,
               tracker: ChangeTracker, context: dict) -> None:
         doc_tree: DocTree = context.get("doc_tree")
@@ -111,6 +121,7 @@ class MdCleanupRule(BaseRule):
             start_index=body.start_index,
             end_index=body_end_index,
             target_indices=target_indices,
+            skip_ranges=self._ref_skip_ranges(doc_tree),
         )
         if normalized_num_defs or normalized_prefix_runs:
             tracker.record(
@@ -293,6 +304,7 @@ class MdCleanupRule(BaseRule):
             start_index=body.start_index,
             end_index=body_end_index,
             target_indices=target_indices,
+            skip_ranges=self._ref_skip_ranges(doc_tree),
         )
         if removed_list_markers > 0:
             tracker.record(
@@ -1456,6 +1468,7 @@ class MdCleanupRule(BaseRule):
         start_index: int,
         end_index: int,
         target_indices: set[int] | None,
+        skip_ranges: list[tuple[int, int]] | None = None,
     ) -> tuple[int, int]:
         if start_index < 0:
             start_index = 0
@@ -1470,6 +1483,8 @@ class MdCleanupRule(BaseRule):
             if idx < start_index or idx > end_index:
                 continue
             if target_set is not None and idx not in target_set:
+                continue
+            if skip_ranges and any(s <= idx <= e for s, e in skip_ranges):
                 continue
             marker_values = self._get_list_marker_values(para)
             if not marker_values:
@@ -1556,6 +1571,7 @@ class MdCleanupRule(BaseRule):
         start_index: int,
         end_index: int,
         target_indices: set[int] | None,
+        skip_ranges: list[tuple[int, int]] | None = None,
     ) -> tuple[int, int]:
         """修复“空列表符号段落 + 正文段落”错位，避免出现孤立圆点行。"""
         if start_index < 0:
@@ -1573,6 +1589,9 @@ class MdCleanupRule(BaseRule):
                 i += 1
                 continue
             if target_set is not None and i not in target_set:
+                i += 1
+                continue
+            if skip_ranges and any(s <= i <= e for s, e in skip_ranges):
                 i += 1
                 continue
             para = doc.paragraphs[i]

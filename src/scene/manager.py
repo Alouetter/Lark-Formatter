@@ -27,6 +27,12 @@ from src.scene.schema import (
 )
 from src.utils.heading_numbering_v2 import legacy_levels_from_v2
 from src.utils.indent import sync_style_config_indent_fields
+from src.utils.line_spacing import (
+    normalize_paragraph_spacing_unit,
+    normalize_paragraph_spacing_value,
+    paragraph_spacing_value_to_pt,
+    sync_style_config_spacing_fields,
+)
 
 
 def _builtin_seed_candidates() -> list[Path]:
@@ -291,6 +297,24 @@ def _parse_margin(data: dict) -> MarginConfig:
 
 def _parse_style(data: dict) -> StyleConfig:
     return StyleConfig(**{k: data[k] for k in StyleConfig.__dataclass_fields__ if k in data})
+
+
+def _formula_spacing_value(raw: dict, side: str, default_cfg: FormulaTableConfig) -> tuple[float, str, float]:
+    prefix = f"formula_space_{side}"
+    legacy_pt = normalize_paragraph_spacing_value(
+        raw.get(f"{prefix}_pt", getattr(default_cfg, f"{prefix}_pt"))
+    )
+    unit = normalize_paragraph_spacing_unit(
+        raw.get(f"{prefix}_unit", getattr(default_cfg, f"{prefix}_unit", "pt"))
+    )
+    value = normalize_paragraph_spacing_value(
+        raw.get(f"{prefix}_value", legacy_pt if unit not in {"line", "auto"} else 0.0)
+    )
+    if unit in {"pt", "in", "cm", "mm"}:
+        legacy_pt = paragraph_spacing_value_to_pt(value, unit)
+    else:
+        legacy_pt = 0.0
+    return value, unit, legacy_pt
 
 
 def _parse_heading_level(data: dict) -> HeadingLevelConfig:
@@ -1556,6 +1580,12 @@ def _build_scene_config(
         if not isinstance(raw, dict):
             raw = {}
         default_cfg = FormulaTableConfig()
+        formula_space_before_value, formula_space_before_unit, formula_space_before_pt = _formula_spacing_value(
+            raw, "before", default_cfg
+        )
+        formula_space_after_value, formula_space_after_unit, formula_space_after_pt = _formula_spacing_value(
+            raw, "after", default_cfg
+        )
         config.formula_table = FormulaTableConfig(
             formula_font_name=str(
                 raw.get("formula_font_name", default_cfg.formula_font_name)
@@ -1572,12 +1602,12 @@ def _build_scene_config(
             formula_line_spacing=float(
                 raw.get("formula_line_spacing", default_cfg.formula_line_spacing)
             ),
-            formula_space_before_pt=float(
-                raw.get("formula_space_before_pt", default_cfg.formula_space_before_pt)
-            ),
-            formula_space_after_pt=float(
-                raw.get("formula_space_after_pt", default_cfg.formula_space_after_pt)
-            ),
+            formula_space_before_pt=formula_space_before_pt,
+            formula_space_after_pt=formula_space_after_pt,
+            formula_space_before_value=formula_space_before_value,
+            formula_space_before_unit=formula_space_before_unit,
+            formula_space_after_value=formula_space_after_value,
+            formula_space_after_unit=formula_space_after_unit,
             block_alignment=str(
                 raw.get("block_alignment", default_cfg.block_alignment)
             ).strip().lower() or default_cfg.block_alignment,
@@ -1660,6 +1690,7 @@ def _build_scene_config(
     for style_cfg in config.styles.values():
         if isinstance(style_cfg, StyleConfig):
             sync_style_config_indent_fields(style_cfg)
+            sync_style_config_spacing_fields(style_cfg)
     config._backfilled_styles = _backfilled  # type: ignore[attr-defined]
 
     if "output" in payload:
@@ -1840,6 +1871,7 @@ def save_scene(config: SceneConfig, path: Path) -> None:
     for style_cfg in getattr(config, "styles", {}).values():
         if isinstance(style_cfg, StyleConfig):
             sync_style_config_indent_fields(style_cfg)
+            sync_style_config_spacing_fields(style_cfg)
     data = asdict(config)
     if isinstance(data.get("available_sections"), list):
         data["available_sections"] = [

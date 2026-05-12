@@ -477,6 +477,10 @@ class WhitespaceNormalizeRule(BaseRule):
         changed_para_count = 0
         changed_text_nodes = 0
 
+        # Compute reference section range to protect GB/T 7714 punctuation.
+        doc_tree = context.get("doc_tree") if isinstance(context, dict) else None
+        _ref_section = doc_tree.get_section("references") if doc_tree else None
+
         for para_idx, para in enumerate(doc.paragraphs):
             if target_indices and para_idx not in target_indices:
                 continue
@@ -515,6 +519,8 @@ class WhitespaceNormalizeRule(BaseRule):
                     changed_text_nodes += 1
 
             # Phase 2: context-aware full/half-width conversion.
+            _in_ref = (_ref_section is not None
+                       and _ref_section.start_index <= para_idx <= _ref_section.end_index)
             if smart_full_half_convert and (
                     punctuation_by_context
                     or bracket_by_inner_language
@@ -526,8 +532,8 @@ class WhitespaceNormalizeRule(BaseRule):
                     para_text,
                     para_counts=para_counts,
                     min_confidence=context_min_confidence,
-                    punctuation_by_context=punctuation_by_context,
-                    bracket_by_inner_language=bracket_by_inner_language,
+                    punctuation_by_context=punctuation_by_context and not _in_ref,
+                    bracket_by_inner_language=bracket_by_inner_language and not _in_ref,
                     fullwidth_alnum_to_halfwidth=fullwidth_alnum_to_halfwidth,
                     quote_by_context=quote_by_context,
                     protect_reference_numbering=protect_reference_numbering,
@@ -553,8 +559,8 @@ class WhitespaceNormalizeRule(BaseRule):
                                 old,
                                 para_counts=para_counts,
                                 min_confidence=context_min_confidence,
-                                punctuation_by_context=punctuation_by_context,
-                                bracket_by_inner_language=bracket_by_inner_language,
+                                punctuation_by_context=punctuation_by_context and not _in_ref,
+                                bracket_by_inner_language=bracket_by_inner_language and not _in_ref,
                                 fullwidth_alnum_to_halfwidth=fullwidth_alnum_to_halfwidth,
                                 quote_by_context=quote_by_context,
                                 protect_reference_numbering=protect_reference_numbering,

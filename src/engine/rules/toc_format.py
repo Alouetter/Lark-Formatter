@@ -1,6 +1,7 @@
 """目录内容重建与格式化规则：清除旧 TOC、根据标题重建条目、包装域代码、应用格式"""
 
 import re
+from collections import Counter, defaultdict
 from copy import deepcopy
 from types import SimpleNamespace
 from lxml import etree
@@ -30,7 +31,8 @@ from src.utils.heading_numbering_v2 import (
     merged_level_binding,
 )
 from src.utils.indent import apply_style_config_indents
-from src.utils.line_spacing import apply_line_spacing, sync_spacing_ooxml
+from src.utils.line_spacing import apply_line_spacing, apply_style_paragraph_spacing, sync_style_spacing_ooxml
+from src.utils.docx_heading_semantics import get_paragraph_outline_level
 from src.utils.ooxml import apply_explicit_rfonts
 from src.utils.toc_entry import (
     looks_like_toc_entry_line,
@@ -310,6 +312,13 @@ def _fallback_collect_headings(doc: Document, config: SceneConfig, toc_section=N
         level = _style_to_level(config, style_name)
 
         if level is None:
+            outline_level = get_paragraph_outline_level(para)
+            if outline_level == 0:
+                level = "heading1"
+            elif outline_level == 1:
+                level = "heading2"
+
+        if level is None:
             if _RE_LEVEL2.match(text):
                 level = "heading3"
             elif _RE_LEVEL1.match(text):
@@ -491,7 +500,10 @@ def _build_front_matter_toc_entries(doc: Document, doc_tree: DocTree) -> list[di
             txt = doc.paragraphs[para_index].text.strip()
             if looks_like_toc_entry_line(txt):
                 continue
-            title = txt or fallback
+            if sec_type == "abstract_cn":
+                title = txt if getattr(sec, "title_confident", True) and _looks_like_abstract_cn_title(txt) else fallback
+            else:
+                title = txt if getattr(sec, "title_confident", True) and _looks_like_abstract_en_title(txt) else fallback
             _push("heading1", "", title, "", para_index)
             continue
 
@@ -693,6 +705,93 @@ def _bookmark_name_for_para(para_index: int) -> str:
     return f"{_TOC_BOOKMARK_PREFIX}{para_index}"
 
 
+def _element_belongs_to_removed_toc_block(node, removed_ids: set[int]) -> bool:
+    cur = node
+    while cur is not None:
+        if id(cur) in removed_ids:
+            return True
+        cur = cur.getparent()
+    return False
+
+
+def _collect_rebalance_bookmark_markers(doc: Document, toc_elements: list) -> tuple[list, list]:
+    """Keep native bookmark counts balanced when old TOC paragraphs are deleted."""
+    removed_ids = {id(el) for el in toc_elements}
+    removed_starts: dict[str, list] = defaultdict(list)
+    removed_ends: dict[str, list] = defaultdict(list)
+    outside_start_counts: Counter[str] = Counter()
+    outside_end_counts: Counter[str] = Counter()
+
+    for b_start in doc.element.body.iter(_w("bookmarkStart")):
+        name = (b_start.get(_w("name")) or "").strip()
+        if name.startswith(_TOC_BOOKMARK_PREFIX):
+            continue
+        bid = (b_start.get(_w("id")) or "").strip()
+        if not bid:
+            continue
+        if _element_belongs_to_removed_toc_block(b_start, removed_ids):
+            removed_starts[bid].append(deepcopy(b_start))
+        else:
+            outside_start_counts[bid] += 1
+
+    for b_end in doc.element.body.iter(_w("bookmarkEnd")):
+        bid = (b_end.get(_w("id")) or "").strip()
+        if not bid:
+            continue
+        if _element_belongs_to_removed_toc_block(b_end, removed_ids):
+            removed_ends[bid].append(deepcopy(b_end))
+        else:
+            outside_end_counts[bid] += 1
+
+    preserved_starts: list = []
+    preserved_ends: list = []
+    all_ids = set(removed_starts) | set(removed_ends) | set(outside_start_counts) | set(outside_end_counts)
+    for bid in sorted(all_ids, key=lambda raw: (0, int(raw)) if raw.isdigit() else (1, raw)):
+        start_deficit = max(0, outside_end_counts.get(bid, 0) - outside_start_counts.get(bid, 0))
+        end_deficit = max(0, outside_start_counts.get(bid, 0) - outside_end_counts.get(bid, 0))
+        if start_deficit:
+            preserved_starts.extend(deepcopy(el) for el in removed_starts.get(bid, [])[:start_deficit])
+        if end_deficit:
+            preserved_ends.extend(deepcopy(el) for el in removed_ends.get(bid, [])[:end_deficit])
+
+    return preserved_starts, preserved_ends
+
+
+def _first_para_element(elements: list):
+    for el in elements:
+        tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+        if tag == "p":
+            return el
+    return None
+
+
+def _last_para_element(elements: list):
+    for el in reversed(elements):
+        tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+        if tag == "p":
+            return el
+    return None
+
+
+def _inject_preserved_bookmark_markers(new_elements: list, preserved_starts: list, preserved_ends: list) -> None:
+    if not preserved_starts and not preserved_ends:
+        return
+
+    first_para = _first_para_element(new_elements)
+    last_para = _last_para_element(new_elements)
+    if first_para is None or last_para is None:
+        return
+
+    ppr = first_para.find(_w("pPr"))
+    insert_idx = list(first_para).index(ppr) + 1 if ppr is not None else 0
+    for marker in preserved_starts:
+        first_para.insert(insert_idx, deepcopy(marker))
+        insert_idx += 1
+
+    for marker in preserved_ends:
+        last_para.append(deepcopy(marker))
+
+
 def _purge_generated_toc_bookmarks(doc: Document) -> int:
     """Remove stale auto-generated TOC bookmarks to avoid wrong PAGEREF targets."""
     to_remove_ids: set[str] = set()
@@ -881,16 +980,9 @@ def _format_toc_para(para, sc: StyleConfig, is_title: bool = False):
         pf.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
     # 间距
-    pf.space_before = Pt(sc.space_before_pt)
-    pf.space_after = Pt(sc.space_after_pt)
+    apply_style_paragraph_spacing(pf, sc)
     apply_line_spacing(pf, sc.line_spacing_type, sc.line_spacing_pt)
-    sync_spacing_ooxml(
-        para._element,
-        space_before_pt=sc.space_before_pt,
-        space_after_pt=sc.space_after_pt,
-        line_spacing_type=sc.line_spacing_type,
-        line_spacing_value=sc.line_spacing_pt,
-    )
+    sync_style_spacing_ooxml(para._element, sc)
 
     # 缩进：按配置字符数应用（与正文样式一致的换算规则）。
     apply_style_config_indents(pf, para._element, sc)
@@ -1047,16 +1139,9 @@ def _normalize_toc_style(style, sc: StyleConfig | None = None) -> None:
         pf.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
     apply_style_config_indents(pf, style.element, sc)
-    pf.space_before = Pt(sc.space_before_pt)
-    pf.space_after = Pt(sc.space_after_pt)
+    apply_style_paragraph_spacing(pf, sc)
     apply_line_spacing(pf, sc.line_spacing_type, sc.line_spacing_pt)
-    sync_spacing_ooxml(
-        style.element,
-        space_before_pt=sc.space_before_pt,
-        space_after_pt=sc.space_after_pt,
-        line_spacing_type=sc.line_spacing_type,
-        line_spacing_value=sc.line_spacing_pt,
-    )
+    sync_style_spacing_ooxml(style.element, sc)
 
     style.font.name = sc.font_en
     style.font.size = Pt(sc.size_pt)
@@ -1620,6 +1705,7 @@ class TocFormatRule(BaseRule):
         # 检测旧 TOC 段落中是否包含分页符（w:br type="page"）
         had_page_break = _has_page_break(toc_elements)
         preserved_sect_pr = _extract_last_toc_section_break(toc_elements)
+        preserved_starts, preserved_ends = _collect_rebalance_bookmark_markers(doc, toc_elements)
 
         # 记录插入位置（在删除前获取索引）
         insert_idx = list(body_el).index(toc_elements[0])
@@ -1647,6 +1733,7 @@ class TocFormatRule(BaseRule):
         # 插入新元素
         for i, el in enumerate(new_elements):
             body_el.insert(insert_idx + i, el)
+        _inject_preserved_bookmark_markers(new_elements, preserved_starts, preserved_ends)
         if new_elements:
             _apply_section_break_to_para(new_elements[-1], preserved_sect_pr)
 
@@ -1698,6 +1785,7 @@ class TocFormatRule(BaseRule):
 
         had_page_break = _has_page_break(toc_elements)
         preserved_sect_pr = _extract_last_toc_section_break(toc_elements)
+        preserved_starts, preserved_ends = _collect_rebalance_bookmark_markers(doc, toc_elements)
         insert_idx = list(body_el).index(toc_elements[0])
 
         for el in toc_elements:
@@ -1718,6 +1806,7 @@ class TocFormatRule(BaseRule):
 
         for i, el in enumerate(new_elements):
             body_el.insert(insert_idx + i, el)
+        _inject_preserved_bookmark_markers(new_elements, preserved_starts, preserved_ends)
         if new_elements:
             _apply_section_break_to_para(new_elements[-1], preserved_sect_pr)
 
