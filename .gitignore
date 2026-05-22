@@ -13,6 +13,7 @@ tests/
 !tests/
 tests/*
 !tests/test_paragraph_spacing_units.py
+!tests/test_page_scope_bookmarks.py
 *.docx
 
 # Build outputs

@@ -33,7 +33,8 @@ _RANGE_TOKEN_RE = re.compile(r"^(\d+)\s*[-~\u2013\u2014\uFF0D\uFF5E]\s*(\d+)$")
 _SINGLE_TOKEN_RE = re.compile(r"^\d+$")
 _SPLIT_RE = re.compile(r"[,\uFF0C;\uFF1B\u3001]+")
 
-_PAGE_SCOPE_BOOKMARK_PREFIX = "_LF_PAGE_SCOPE_"
+_PAGE_SCOPE_BOOKMARK_PREFIX = "LF_PAGE_SCOPE_"
+_LEGACY_PAGE_SCOPE_BOOKMARK_PREFIXES = ("_LF_PAGE_SCOPE_",)
 _DEFAULT_TIMEOUT_SEC = 30
 _WORD_PAGE_NUMBER_INFO = 3
 
@@ -72,6 +73,10 @@ try:
         False, True, False, "", "", False, "", "", 0, 0, False, True
     )
     doc.Repaginate()
+    try:
+        doc.Bookmarks.ShowHidden = True
+    except Exception:
+        pass
 
     spans = {}
     for bookmark in list(doc.Bookmarks):
@@ -127,6 +132,10 @@ try {
     $word.DisplayAlerts = 0
     $doc = $word.Documents.Open($docPath, $false, $true)
     $doc.Repaginate() | Out-Null
+    try {
+        $doc.Bookmarks.ShowHidden = $true
+    } catch {
+    }
 
     $spans = @{}
     foreach ($bookmark in @($doc.Bookmarks)) {
@@ -311,11 +320,15 @@ def _page_scope_bookmark_name(para_index: int) -> str:
     return f"{_PAGE_SCOPE_BOOKMARK_PREFIX}{para_index}"
 
 
+def _is_page_scope_bookmark_name(name: str) -> bool:
+    return name.startswith((_PAGE_SCOPE_BOOKMARK_PREFIX, *_LEGACY_PAGE_SCOPE_BOOKMARK_PREFIXES))
+
+
 def _strip_generated_probe_bookmarks(body_el) -> None:
     stale_ids: set[str] = set()
     for b_start in list(body_el.iter(_BOOKMARK_START)):
         name = (b_start.get(_BOOKMARK_NAME) or "").strip()
-        if not name.startswith(_PAGE_SCOPE_BOOKMARK_PREFIX):
+        if not _is_page_scope_bookmark_name(name):
             continue
         bid = (b_start.get(_BOOKMARK_ID) or "").strip()
         if bid:
